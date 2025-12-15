@@ -1,0 +1,18 @@
+[[permission]]
+identifier = "allow-archivebox-commands"
+description = "允许 ArchiveBox 自定义命令"
+
+[permission.commands]
+allow = [
+    "pick_zip_files",
+    "import_zips",
+    "export_excel",
+    "export_excel_with_selection",
+    "export_bundle_zip",
+    "export_bundle_zip_with_selection",
+    "open_path",
+    "get_preview_image_data",
+    "get_preview_pdf_image_data",
+    "save_pdf_page_screenshots",
+]
+deny = []

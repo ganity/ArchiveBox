@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ZIP 资料聚合工具</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="./style.css" />
+</head>
+
+<body>
+  <main class="app-shell">
+
+
+    <section class="toolbar">
+      <button id="pickZipsBtn">选择ZIP导入</button>
+      <button id="exportExcelBtn" disabled>导出Excel</button>
+      <button id="exportBundleBtn" disabled>导出汇总包ZIP</button>
+    </section>
+
+    <section class="content">
+      <div class="panel">
+        <div class="panel-title">ZIP列表</div>
+        <div class="panel-search"><input type="text" id="searchInput" placeholder="搜索ZIP..." class="search-input" />
+        </div>
+        <div class="panel-toolbar">
+          <div class="row-tight">
+            <button id="selectAllBtn" class="sm-btn">全选</button>
+            <button id="invertSelBtn" class="sm-btn">反选</button>
+          </div>
+        </div>
+        <div id="zipList" class="list"></div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">详情</div>
+        <div id="details" class="details"></div>
+      </div>
+    </section>
+
+    <footer class="footer">
+      <div id="status" class="status">就绪</div>
+    </footer>
+  </main>
+
+  <div id="imageModal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-backdrop" id="imageModalBackdrop"></div>
+    <div class="modal-content">
+      <div class="modal-toolbar">
+        <div id="imageModalTitle" class="modal-title"></div>
+        <div class="row">
+          <button id="imageModalOpenBtn">系统打开</button>
+          <button id="imageModalCloseBtn">关闭</button>
+        </div>
+      </div>
+      <img id="imageModalImg" class="modal-img" alt="预览" />
+    </div>
+  </div>
+
+  <script src="./vendor/pdfjs/pdf.min.js"></script>
+  <script type="module" src="./main.js"></script>
+</body>
+
+</html>
