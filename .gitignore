@@ -101,3 +101,6 @@ zip_simples/
 
 # Generated files
 *.generated.*
+
+/frontend_bar/
+/src-tauri_bar/

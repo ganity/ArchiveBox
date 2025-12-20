@@ -10,9 +10,11 @@ allow = [
     "export_excel_with_selection",
     "export_bundle_zip",
     "export_bundle_zip_with_selection",
+    "export_bundle_zip_with_embeddings",
+    "get_embedding_config",
     "open_path",
     "get_preview_image_data",
-    "get_preview_pdf_image_data",
+    "get_excel_preview_data",
     "save_pdf_page_screenshots",
 ]
 deny = []

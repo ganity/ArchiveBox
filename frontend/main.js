@@ -193,8 +193,8 @@ function initSelectionsForBatch() {
       videos: (z.video_files ?? []).map(() => true),
       images: (z.image_files ?? []).map(() => true),
       pdfFiles: (z.pdf_files ?? []).map(() => false),
-      pdfImages: (z.pdf_image_files ?? []).map(() => false),
       pdfScreens: (z.pdf_page_screenshot_files ?? []).map(() => true),
+      excels: (z.excel_files ?? []).map(() => true),
     };
     state.imageDataCache[z.id] = {};
   }
@@ -305,17 +305,44 @@ async function loadImageData(zipId, index) {
   return dataUrl;
 }
 
-async function loadPdfImageData(zipId, index) {
+async function loadExcelPreviewData(zipId, index) {
   if (!state.imageDataCache[zipId]) state.imageDataCache[zipId] = {};
-  const key = `pdf:${index}`;
+  const key = `excel:${index}`;
   if (state.imageDataCache[zipId][key]) return state.imageDataCache[zipId][key];
-  const dataUrl = await invoke("get_preview_pdf_image_data", {
+
+  const data = await invoke("get_excel_preview_data", {
     batchId: state.batchId,
     zipId,
     index,
   });
-  state.imageDataCache[zipId][key] = dataUrl;
-  return dataUrl;
+  state.imageDataCache[zipId][key] = data;
+  return data;
+}
+
+function renderExcelTable(excelData) {
+  const container = document.createElement("div");
+  container.className = "excel-preview";
+
+  const info = document.createElement("div");
+  info.className = "excel-info small";
+  info.textContent = `工作表: ${excelData.sheet_name} (共${excelData.total_sheets}个表，显示前10行)`;
+  container.appendChild(info);
+
+  const table = document.createElement("table");
+  table.className = "excel-table";
+
+  for (const row of excelData.rows) {
+    const tr = document.createElement("tr");
+    for (const cell of row) {
+      const td = document.createElement("td");
+      td.textContent = cell || "";
+      tr.appendChild(td);
+    }
+    table.appendChild(tr);
+  }
+
+  container.appendChild(table);
+  return container;
 }
 
 function section(title) {
@@ -405,8 +432,8 @@ async function renderDetails() {
     { label: "视频", value: z.video_files?.length ?? 0, icon: "🎬" },
     { label: "图片", value: z.image_files?.length ?? 0, icon: "🖼️" },
     { label: "PDF", value: z.pdf_files?.length ?? 0, icon: "📄" },
+    { label: "Excel", value: z.excel_files?.length ?? 0, icon: "📊" },
     { label: "PDF截图", value: z.pdf_page_screenshot_files?.length ?? 0, icon: "📸" },
-    { label: "PDF图片", value: z.pdf_image_files?.length ?? 0, icon: "✂️" },
   ];
 
   stats.forEach(stat => {
@@ -729,75 +756,93 @@ async function renderDetails() {
   }
   el.details.appendChild(pdfScreens);
 
-  const pdfImgs = section("PDF页面图片");
-  const pdfImageFiles = z.pdf_image_files ?? [];
-  addSelectAllInvert(pdfImgs, {
-    disabled: pdfImageFiles.length === 0,
+  // Excel section
+  const excels = section("Excel文件");
+  const excelFiles = z.excel_files ?? [];
+  addSelectAllInvert(excels, {
+    disabled: excelFiles.length === 0,
     onAll: () => {
-      setAll(sel.pdfImages, true);
+      setAll(sel.excels, true);
       renderDetails();
     },
     onInvert: () => {
-      invertAll(sel.pdfImages);
+      invertAll(sel.excels);
       renderDetails();
     },
   });
-  if (!pdfImageFiles.length) {
+  if (!excelFiles.length) {
     const p = document.createElement("div");
     p.className = "small";
-    p.textContent = "无PDF图片";
-    pdfImgs.appendChild(p);
+    p.textContent = "无Excel文件";
+    excels.appendChild(p);
   } else {
-    const thumbs2 = document.createElement("div");
-    thumbs2.className = "thumbs";
-    for (let i = 0; i < pdfImageFiles.length; i++) {
+    for (let i = 0; i < excelFiles.length; i++) {
       const card = document.createElement("div");
-      card.className = "thumb";
+      card.className = "excel-card";
+
       const row = document.createElement("div");
       row.className = "row";
+
       const cb = document.createElement("input");
       cb.type = "checkbox";
-      cb.checked = sel.pdfImages[i];
+      cb.checked = sel.excels[i];
       cb.onchange = () => {
-        sel.pdfImages[i] = cb.checked;
+        sel.excels[i] = cb.checked;
       };
+
       const name = document.createElement("div");
-      name.textContent = basename(pdfImageFiles[i]);
+      name.textContent = basename(excelFiles[i]);
       name.className = "small";
+
       const openBtn = document.createElement("button");
-      openBtn.textContent = "打开";
+      openBtn.textContent = "系统打开";
       openBtn.onclick = async () => {
         try {
-          await invoke("open_path", { path: pdfImageFiles[i] });
+          await invoke("open_path", { path: excelFiles[i] });
         } catch (e) {
           setStatus(`打开失败：${e?.message ?? e}`);
         }
       };
+
+      const previewBtn = document.createElement("button");
+      previewBtn.textContent = "预览";
+      previewBtn.onclick = async () => {
+        try {
+          const previewContainer = card.querySelector(".excel-preview-container");
+          if (previewContainer.style.display === "block") {
+            previewContainer.style.display = "none";
+            previewBtn.textContent = "预览";
+          } else {
+            if (!previewContainer.hasChildNodes()) {
+              setStatus("正在加载Excel预览...");
+              const data = await loadExcelPreviewData(z.id, i);
+              const table = renderExcelTable(data);
+              previewContainer.appendChild(table);
+              setStatus("Excel预览加载完成");
+            }
+            previewContainer.style.display = "block";
+            previewBtn.textContent = "收起";
+          }
+        } catch (e) {
+          setStatus(`预览失败：${e?.message ?? e}`);
+        }
+      };
+
       row.appendChild(cb);
       row.appendChild(openBtn);
+      row.appendChild(previewBtn);
       row.appendChild(name);
       card.appendChild(row);
 
-      const img = document.createElement("img");
-      img.alt = basename(pdfImageFiles[i]);
-      img.src = "";
-      img.style.cursor = "pointer";
-      card.appendChild(img);
+      const previewContainer = document.createElement("div");
+      previewContainer.className = "excel-preview-container";
+      previewContainer.style.display = "none";
+      card.appendChild(previewContainer);
 
-      thumbs2.appendChild(card);
-
-      loadPdfImageData(z.id, i)
-        .then((dataUrl) => {
-          img.src = dataUrl;
-          img.onclick = () => openImageModal({ title: basename(pdfImageFiles[i]), path: pdfImageFiles[i], src: dataUrl });
-        })
-        .catch(() => {
-          img.src = "";
-        });
+      excels.appendChild(card);
     }
-    pdfImgs.appendChild(thumbs2);
   }
-  el.details.appendChild(pdfImgs);
+  el.details.appendChild(excels);
 }
 
 el.pickZipsBtn.onclick = async () => {
@@ -845,7 +890,9 @@ el.exportExcelBtn.onclick = async () => {
 el.exportBundleBtn.onclick = async () => {
   try {
     if (!state.batchId) return;
-    setStatus("正在导出汇总包…");
+
+    setStatus("正在导出Word文档（文件嵌入模式）...");
+
     const selection = {
       zips: state.zips.map((z) => ({
         zip_id: z.id,
@@ -854,15 +901,18 @@ el.exportBundleBtn.onclick = async () => {
         selected_video_indices: selectedIndices(state.selection[z.id]?.videos ?? []),
         selected_image_indices: selectedIndices(state.selection[z.id]?.images ?? []),
         selected_pdf_indices: selectedIndices(state.selection[z.id]?.pdfFiles ?? []),
-        selected_pdf_image_indices: selectedIndices(state.selection[z.id]?.pdfImages ?? []),
+        selected_excel_indices: selectedIndices(state.selection[z.id]?.excels ?? []),
         selected_pdf_page_screenshot_indices: selectedIndices(state.selection[z.id]?.pdfScreens ?? []),
       })),
     };
+
     const outPath = await invoke("export_bundle_zip_with_selection", {
       batchId: state.batchId,
       selection,
+      embedFiles: true,
     });
-    setStatus(`汇总包已导出：${outPath}`);
+
+    setStatus(`Word文档已导出：${outPath}`);
   } catch (e) {
     console.error(e);
     setStatus(`导出失败：${e?.message ?? e}`);
