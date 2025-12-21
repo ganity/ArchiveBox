@@ -154,10 +154,10 @@ button#pickZipsBtn:hover {
 
 .panel:first-child {
   /* ZIP List Side */
-  flex: 0 0 240px;
-  /* Reduced width */
-  min-width: 200px;
-  max-width: 400px;
+  flex: 0 0 280px;
+  /* 增加宽度以显示完整文件名 */
+  min-width: 240px;
+  max-width: 450px;
 }
 
 .panel:last-child {
@@ -781,4 +781,40 @@ button#pickZipsBtn:hover {
 
 .excel-table tr:hover {
   background: #f3f4f6;
+}
+
+/* ZIP统计信息样式 */
+.zip-stats {
+  display: none; /* 默认隐藏，没有ZIP时显示 */
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-sm) var(--space-md);
+  background: var(--bg-element);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  margin-bottom: var(--space-sm);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.stat-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.stat-label {
+  font-weight: 500;
+  color: var(--text-muted);
+}
+
+.stat-value {
+  font-weight: 600;
+  color: var(--text-main);
+  min-width: 20px;
+  text-align: center;
+}
+
+.stat-unit {
+  color: var(--text-muted);
 }

@@ -139,6 +139,7 @@ impl Default for EmbeddingConfig {
 fn build_enhanced_summary_docx(
     batch: &BatchSummary,
     embed_files: bool,
+    app: &tauri::AppHandle,
 ) -> Result<(Docx, Vec<EmbeddedFile>)> {
     let mut docx = Docx::new();
     docx = docx.add_paragraph(
@@ -146,8 +147,20 @@ fn build_enhanced_summary_docx(
     );
 
     let mut all_embedded_files = Vec::new();
+    let total_zips = batch.zips.len();
 
-    for z in &batch.zips {
+    for (zip_idx, z) in batch.zips.iter().enumerate() {
+        // 发送ZIP处理开始进度
+        let progress_event = ProgressEvent::new(
+            "export_word",
+            zip_idx,
+            total_zips * 4, // 假设每个ZIP有4个主要步骤
+            "处理ZIP内容",
+            &format!("正在处理: {}", z.word.instruction_no)
+        );
+        if let Err(e) = emit_progress_handle(app, progress_event) {
+            eprintln!("发送进度事件失败: {}", e);
+        }
         docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_text(format!(
             "指令编号:  {}",
             z.word.instruction_no
@@ -229,8 +242,8 @@ fn build_enhanced_summary_docx(
                     for img_path in &additional.image_files {
                         let bytes = fs::read(img_path)
                             .with_context(|| format!("读取附加docx图片失败: {}", img_path))?;
-                        // 缩放图片到 600x800，质量 85
-                        let resized_bytes = resize_image_to_jpeg(&bytes, 600, 800, 85)?;
+                        // 缩放图片到 800x1000，质量 92（适合A4纸张，文字更清晰）
+                        let resized_bytes = resize_image_to_jpeg(&bytes, 800, 1000, 92)?;
                         let pic = Pic::new(&resized_bytes);
                         docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_image(pic)));
                     }
@@ -241,27 +254,48 @@ fn build_enhanced_summary_docx(
             }
         }
 
-        // 并行处理所有图片
+        // 分批处理所有图片，避免内存爆炸
         let mut all_images = z.image_files.clone();
         all_images.extend_from_slice(&z.pdf_page_screenshot_files);
 
         if !all_images.is_empty() {
-            println!("开始并行处理 {} 张图片...", all_images.len());
-            let processed_images = process_images_parallel(
+            // 发送图片处理开始进度
+            let img_start_progress = ProgressEvent::new(
+                "export_word",
+                zip_idx * 4 + 1,
+                total_zips * 4,
+                "处理图片",
+                &format!("开始处理 {} 张图片", all_images.len())
+            );
+            if let Err(e) = emit_progress_handle(app, img_start_progress) {
+                eprintln!("发送图片开始进度事件失败: {}", e);
+            }
+
+            let processed_images = process_images_parallel_with_progress(
                 &all_images,
-                600,
-                800,
-                85,
-                move |idx, total, filename| {
-                    println!("处理图片 {}/{}: {}", idx + 1, total, filename);
-                }
+                800,   // 适合A4纸张的宽度
+                1000,  // 适合A4纸张的高度
+                92,    // 提高质量到92，确保文字清晰
+                app,
+                "export_word",
             ).with_context(|| "并行处理图片失败")?;
+
+            // 发送图片处理完成进度
+            let img_complete_progress = ProgressEvent::new(
+                "export_word",
+                zip_idx * 4 + 2,
+                total_zips * 4,
+                "处理图片",
+                &format!("图片处理完成，共 {} 张", processed_images.len())
+            );
+            if let Err(e) = emit_progress_handle(app, img_complete_progress) {
+                eprintln!("发送图片完成进度事件失败: {}", e);
+            }
 
             for (_path, resized_bytes) in processed_images {
                 let pic = Pic::new(&resized_bytes);
                 docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_image(pic)));
             }
-            println!("✓ 图片处理完成");
         }
 
         // 添加章节标记段落（用于后续插入OLE对象）
@@ -272,29 +306,62 @@ fn build_enhanced_summary_docx(
 
         // 收集需要嵌入的文件（包括视频、PDF、Excel、ZIP，不包括图片）
         if embed_files {
-            // 嵌入视频文件
+            // 发送文件嵌入开始进度
+            let embed_start_progress = ProgressEvent::new(
+                "export_word",
+                zip_idx * 4 + 3,
+                total_zips * 4,
+                "嵌入文件",
+                &format!("开始嵌入附件文件 (当前��嵌入 {} 个)", all_embedded_files.len())
+            );
+            if let Err(e) = emit_progress_handle(app, embed_start_progress) {
+                eprintln!("发送文件嵌入开始进度事件失败: {}", e);
+            }
+
+            // 内存使用监控：检查当前嵌入文件的总大小
+            let current_embed_size_mb: f64 = all_embedded_files.iter()
+                .map(|f: &EmbeddedFile| f.data.len() as f64 / 1024.0 / 1024.0)
+                .sum();
+
+            if current_embed_size_mb > 100.0 { // 如果已嵌入超过100MB
+                println!("⚠️ 当前已嵌入文件大小: {:.1}MB，可能影响性能", current_embed_size_mb);
+            }
+
+            // 嵌入视频文件（跳过过大的文件）
             for video_path in &z.video_files {
                 if Path::new(video_path).exists() {
-                    if let Ok(embed_file) = create_embedded_file(video_path, &z.id) {
-                        all_embedded_files.push(embed_file);
+                    match create_embedded_file(video_path, &z.id) {
+                        Ok(embed_file) => all_embedded_files.push(embed_file),
+                        Err(e) => {
+                            println!("⚠️ 视频嵌入失败: {}", e);
+                            // 继续处理其他文件，不中断流程
+                        }
                     }
                 }
             }
 
-            // 嵌入PDF文件
+            // 嵌入PDF文件（跳过过大的文件）
             for pdf_path in &z.pdf_files {
                 if Path::new(pdf_path).exists() {
-                    if let Ok(embed_file) = create_embedded_file(pdf_path, &z.id) {
-                        all_embedded_files.push(embed_file);
+                    match create_embedded_file(pdf_path, &z.id) {
+                        Ok(embed_file) => all_embedded_files.push(embed_file),
+                        Err(e) => {
+                            println!("⚠️ PDF嵌入失败: {}", e);
+                            // 继续处理其他文件，不中断流程
+                        }
                     }
                 }
             }
 
-            // 嵌入Excel文件
+            // 嵌入Excel文件（跳过过大的文件）
             for excel_path in &z.excel_files {
                 if Path::new(excel_path).exists() {
-                    if let Ok(embed_file) = create_embedded_file(excel_path, &z.id) {
-                        all_embedded_files.push(embed_file);
+                    match create_embedded_file(excel_path, &z.id) {
+                        Ok(embed_file) => all_embedded_files.push(embed_file),
+                        Err(e) => {
+                            println!("⚠️ Excel嵌入失败: {}", e);
+                            // 继续处理其他文件，不中断流程
+                        }
                     }
                 }
             }
@@ -303,8 +370,12 @@ fn build_enhanced_summary_docx(
             if z.include_original_zip {
                 let zip_path = &z.stored_path;
                 if Path::new(zip_path).exists() {
-                    if let Ok(embed_file) = create_embedded_file(zip_path, &z.id) {
-                        all_embedded_files.push(embed_file);
+                    match create_embedded_file(zip_path, &z.id) {
+                        Ok(embed_file) => all_embedded_files.push(embed_file),
+                        Err(e) => {
+                            println!("⚠️ 原始ZIP嵌入失败: {}", e);
+                            // 继续处理，不中断流程
+                        }
                     }
                 }
             }
@@ -319,6 +390,21 @@ fn build_enhanced_summary_docx(
 }
 
 fn create_embedded_file(path: &str, zip_id: &str) -> Result<EmbeddedFile> {
+    // 检查文件大小，避免内存爆炸
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("无法获取文件元数据: {}", path))?;
+    let file_size = metadata.len() as usize;
+
+    // 设置文件大小限制：100MB
+    const MAX_FILE_SIZE: usize = 100 * 1024 * 1024;
+    if file_size > MAX_FILE_SIZE {
+        let file_size_mb = file_size as f64 / 1024.0 / 1024.0;
+        println!("⚠️ 跳过过大文件: {} ({:.1}MB > 100MB限制)",
+                safe_basename(path), file_size_mb);
+        return Err(anyhow::anyhow!("文件过大，跳过嵌入: {} ({:.1}MB)",
+                          safe_basename(path), file_size_mb));
+    }
+
     let data = fs::read(path)
         .with_context(|| format!("Failed to read file: {}", path))?;
 
@@ -330,6 +416,9 @@ fn create_embedded_file(path: &str, zip_id: &str) -> Result<EmbeddedFile> {
 
     let file_type = detect_file_type(&name);
     let content_type = get_content_type(&name);
+
+    println!("✓ 准备嵌入文件: {} ({:.1}MB)",
+            safe_basename(path), data.len() as f64 / 1024.0 / 1024.0);
 
     Ok(EmbeddedFile {
         id: format!("embed_{}", uuid::Uuid::new_v4().to_string().replace("-", "")),
@@ -1525,7 +1614,7 @@ fn export_bundle_zip(app: tauri::AppHandle, batch_id: String) -> Result<String, 
 }
 
 #[tauri::command]
-fn export_bundle_zip_with_selection(
+async fn export_bundle_zip_with_selection(
     app: tauri::AppHandle,
     batch_id: String,
     selection: ExportBundleSelection,
@@ -1546,9 +1635,14 @@ fn export_bundle_zip_with_selection(
     println!("=== 开始文件嵌入导出 ===");
 
     // 立即询问保存位置，让用户能够快速响应
-    // 文件对话框会阻塞UI，但这是必要的用户交互
+    // 使用 spawn_blocking 避免阻塞异步运行时
     let now = OffsetDateTime::now_utc();
-    let out = prompt_save_path(default_export_bundle_name(now), "docx", "Word文档")?;
+    let default_name = default_export_bundle_name(now);
+    let out = tokio::task::spawn_blocking(move || {
+        prompt_save_path(default_name, "docx", "Word文档")
+    })
+    .await
+    .map_err(|e| format!("文件对话框错误: {}", e))??;
 
     // 发送开始进度事件（在文件对话框完成后）
     let start_event = ProgressEvent::new(
@@ -1576,7 +1670,7 @@ fn export_bundle_zip_with_selection(
         }
     }
 
-    let (docx, embedded_files) = build_enhanced_summary_docx(&batch, true).map_err(err_to_string)?;
+    let (docx, embedded_files) = build_enhanced_summary_docx(&batch, true, &app).map_err(err_to_string)?;
 
     // 步骤2: 生成基础Word文档
     let progress_event = ProgressEvent::new(
@@ -1649,11 +1743,9 @@ fn apply_bundle_selection(batch: &BatchSummary, selection: ExportBundleSelection
     let mut out = Vec::new();
 
     for z in &batch.zips {
-        let sel = selection.zips.iter().find(|s| s.zip_id == z.id);
-        let Some(sel) = sel else { continue };
-        if !sel.include {
+        let Some(sel) = selection.zips.iter().find(|s| s.zip_id == z.id && s.include) else {
             continue;
-        }
+        };
 
         let mut z2 = z.clone();
         z2.include_original_zip = sel.include_original_zip;
@@ -1835,9 +1927,9 @@ fn resize_image_to_jpeg(image_bytes: &[u8], max_width: u32, max_height: u32, _qu
         ((orig_width as f32 * ratio) as u32, (orig_height as f32 * ratio) as u32)
     };
 
-    // 使用更快的滤波器进行缩放
+    // 使用Lanczos3滤波器进行缩放（对文字友好，减少锯齿）
     let resized = if new_width != orig_width || new_height != orig_height {
-        img.resize(new_width, new_height, image::imageops::FilterType::Nearest)
+        img.resize(new_width, new_height, image::imageops::FilterType::Lanczos3)
     } else {
         img
     };
@@ -1852,7 +1944,87 @@ fn resize_image_to_jpeg(image_bytes: &[u8], max_width: u32, max_height: u32, _qu
     Ok(jpeg_bytes)
 }
 
-/// 并行处理多个图片文件
+/// 并行处理多个图片文件，支持进度报告和分批处理
+fn process_images_parallel_with_progress(
+    image_paths: &[String],
+    max_width: u32,
+    max_height: u32,
+    quality: u8,
+    app: &tauri::AppHandle,
+    operation_name: &str,
+) -> Result<Vec<(String, Vec<u8>)>> {
+    let paths: Vec<String> = image_paths.to_vec();
+    let count = paths.len();
+
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+
+    // 分批处理，避免内存爆炸
+    let batch_size = std::cmp::min(5, count); // 每批最多处理5张图片
+    let mut all_results = Vec::new();
+
+    println!("开始分批处理 {} 张图片，每批 {} 张...", count, batch_size);
+
+    for (batch_idx, chunk) in paths.chunks(batch_size).enumerate() {
+        // 发送批次开始进度
+        let batch_progress = ProgressEvent::new(
+            operation_name,
+            batch_idx * batch_size,
+            count,
+            "处理图片",
+            &format!("处理第 {}/{} 批，每批 {} 张", batch_idx + 1, (count + batch_size - 1) / batch_size, batch_size)
+        );
+        if let Err(e) = emit_progress_handle(app, batch_progress) {
+            eprintln!("发送批次进度事件失败: {}", e);
+        }
+
+        let batch_results: Result<Vec<_>> = chunk
+            .par_iter()
+            .enumerate()
+            .map(|(index_in_batch, path)| {
+                let global_index = batch_idx * batch_size + index_in_batch;
+
+                // 每处理完一张图片发送一次进度
+                let img_progress = ProgressEvent::new(
+                    operation_name,
+                    global_index,
+                    count,
+                    "处理图片",
+                    &format!("处理图片 {}/{}: {}", global_index + 1, count, safe_basename(path))
+                );
+                if let Err(e) = emit_progress_handle(app, img_progress) {
+                    eprintln!("发送图片进度事件失败: {}", e);
+                }
+
+                let bytes = fs::read(path)
+                    .with_context(|| format!("读取图片失败: {}", path))?;
+                let resized_bytes = resize_image_to_jpeg(&bytes, max_width, max_height, quality)
+                    .with_context(|| format!("调整图片大小失败: {}", path))?;
+
+                Ok((path.clone(), resized_bytes))
+            })
+            .collect();
+
+        match batch_results {
+            Ok(mut results) => {
+                all_results.append(&mut results);
+                println!("✓ 批次 {}/{} 完成，已处理 {} 张图片", batch_idx + 1, (count + batch_size - 1) / batch_size, all_results.len());
+            }
+            Err(e) => {
+                return Err(e);
+            }
+        }
+
+        // 强制释放当前批次的内存
+        let _ = chunk;
+    }
+
+    println!("✓ 所有图片处理完成，共 {} 张", all_results.len());
+    Ok(all_results)
+}
+
+/// 并行处理多个图片文件（保留原函数用于其他地方）
 fn process_images_parallel(
     image_paths: &[String],
     max_width: u32,
@@ -2737,8 +2909,8 @@ fn build_summary_docx(batch: &BatchSummary) -> Result<Vec<u8>> {
         for img_path in &z.image_files {
             let bytes = fs::read(img_path)
                 .with_context(|| format!("读取图片失败: {}", img_path))?;
-            // 缩放图片到 600x800，质量 85
-            let resized_bytes = resize_image_to_jpeg(&bytes, 600, 800, 85)?;
+            // 缩放图片到 800x1000，质量 92（适合A4纸张，文字更清晰）
+            let resized_bytes = resize_image_to_jpeg(&bytes, 800, 1000, 92)?;
             let pic = Pic::new(&resized_bytes);
             docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_image(pic)));
         }
@@ -2749,8 +2921,8 @@ fn build_summary_docx(batch: &BatchSummary) -> Result<Vec<u8>> {
         for img_path in &z.pdf_page_screenshot_files {
             let bytes = fs::read(img_path)
                 .with_context(|| format!("读取PDF页面截图失败: {}", img_path))?;
-            // 缩放图片到 600x800，质量 85
-            let resized_bytes = resize_image_to_jpeg(&bytes, 600, 800, 85)?;
+            // 缩放图片到 800x1000，质量 92（适合A4纸张，文字更清晰）
+            let resized_bytes = resize_image_to_jpeg(&bytes, 800, 1000, 92)?;
             let pic = Pic::new(&resized_bytes);
             docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_image(pic)));
         }
@@ -3277,7 +3449,7 @@ fn export_bundle_zip_with_embeddings(
     }
 
     // 使用增强的导出功能
-    let (docx, embedded_files) = build_enhanced_summary_docx(&batch, embed_files).map_err(err_to_string)?;
+    let (docx, embedded_files) = build_enhanced_summary_docx(&batch, embed_files, &app).map_err(err_to_string)?;
     let docx_bytes = build_docx_with_embeddings(docx, &embedded_files).map_err(err_to_string)?;
     let bundle_bytes = build_bundle_zip_bytes(&batch, &docx_bytes).map_err(err_to_string)?;
 

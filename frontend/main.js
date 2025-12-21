@@ -42,6 +42,9 @@ const el = {
   searchInput: document.getElementById("searchInput"),
   selectAllBtn: document.getElementById("selectAllBtn"),
   invertSelBtn: document.getElementById("invertSelBtn"),
+  zipStats: document.getElementById("zipStats"),
+  totalCount: document.getElementById("totalCount"),
+  selectedCount: document.getElementById("selectedCount"),
 };
 
 let state = {
@@ -271,11 +274,32 @@ function selectedIndices(flags) {
 el.searchInput.oninput = (e) => {
   state.filter = e.target.value.trim().toLowerCase();
   renderList();
+  updateZipStats();
 };
 
 function getVisibleZips() {
   if (!state.filter) return state.zips;
   return state.zips.filter(z => z.filename.toLowerCase().includes(state.filter));
+}
+
+// 更新ZIP统计信息
+function updateZipStats() {
+  const visibleZips = getVisibleZips();
+  const total = visibleZips.length;
+
+  const selected = visibleZips.filter(z =>
+    state.selection[z.id]?.include ?? true
+  ).length;
+
+  el.totalCount.textContent = total;
+  el.selectedCount.textContent = selected;
+
+  // 如果没有ZIP文件时隐藏统计信息
+  if (state.zips.length === 0) {
+    el.zipStats.style.display = 'none';
+  } else {
+    el.zipStats.style.display = 'flex';
+  }
 }
 
 el.selectAllBtn.onclick = () => {
@@ -284,6 +308,7 @@ el.selectAllBtn.onclick = () => {
     if (state.selection[z.id]) state.selection[z.id].include = true;
   }
   renderList();
+  updateZipStats();
 };
 
 el.invertSelBtn.onclick = () => {
@@ -292,6 +317,7 @@ el.invertSelBtn.onclick = () => {
     if (state.selection[z.id]) state.selection[z.id].include = !state.selection[z.id].include;
   }
   renderList();
+  updateZipStats();
 };
 
 function renderList() {
@@ -342,6 +368,7 @@ function renderList() {
       }
       renderDetails();
       renderList();
+      updateZipStats();
       setStatus(`已移除 ${z.filename}`);
     };
 
@@ -353,6 +380,9 @@ function renderList() {
   const anyIncluded = state.zips.some((z) => state.selection?.[z.id]?.include);
   el.exportExcelBtn.disabled = !state.batchId || state.zips.length === 0 || !anyIncluded;
   el.exportBundleBtn.disabled = !state.batchId || state.zips.length === 0 || !anyIncluded;
+
+  // 更新统计信息
+  updateZipStats();
 }
 
 async function loadImageData(zipId, index) {
@@ -1127,6 +1157,7 @@ el.pickZipsBtn.onclick = async () => {
     initSelectionsForBatch();
     renderList();
     await renderDetails();
+    updateZipStats();
     setStatus(`导入完成：批次 ${state.batchId}，正在自动生成PDF页面截图…`);
     autoGeneratePdfScreenshots();
   } catch (e) {
