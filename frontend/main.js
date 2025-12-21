@@ -606,27 +606,22 @@ async function renderDetails() {
   ]);
   el.details.appendChild(word);
 
-  const images = section("图片预览（从ZIP直接解压）");
-  const thumbs = document.createElement("div");
-  thumbs.className = "thumbs";
   const imageFiles = z.image_files ?? [];
-  addSelectAllInvert(images, {
-    disabled: imageFiles.length === 0,
-    onAll: () => {
-      setAll(sel.images, true);
-      renderDetails();
-    },
-    onInvert: () => {
-      invertAll(sel.images);
-      renderDetails();
-    },
-  });
-  if (!imageFiles.length) {
-    const p = document.createElement("div");
-    p.className = "small";
-    p.textContent = "无图片";
-    images.appendChild(p);
-  } else {
+  if (imageFiles.length > 0) {
+    const images = section("图片预览（从ZIP直接解压）");
+    const thumbs = document.createElement("div");
+    thumbs.className = "thumbs";
+    addSelectAllInvert(images, {
+      disabled: false,
+      onAll: () => {
+        setAll(sel.images, true);
+        renderDetails();
+      },
+      onInvert: () => {
+        invertAll(sel.images);
+        renderDetails();
+      },
+    });
     for (let i = 0; i < imageFiles.length; i++) {
       const card = document.createElement("div");
       card.className = "thumb";
@@ -673,28 +668,23 @@ async function renderDetails() {
         });
     }
     images.appendChild(thumbs);
+    el.details.appendChild(images);
   }
-  el.details.appendChild(images);
 
-  const videos = section("视频（可预览；失败可系统打开）");
   const videoFiles = z.video_files ?? [];
-  addSelectAllInvert(videos, {
-    disabled: videoFiles.length === 0,
-    onAll: () => {
-      setAll(sel.videos, true);
-      renderDetails();
-    },
-    onInvert: () => {
-      invertAll(sel.videos);
-      renderDetails();
-    },
-  });
-  if (!videoFiles.length) {
-    const p = document.createElement("div");
-    p.className = "small";
-    p.textContent = "无视频";
-    videos.appendChild(p);
-  } else {
+  if (videoFiles.length > 0) {
+    const videos = section("视频（可预览；失败可系统打开）");
+    addSelectAllInvert(videos, {
+      disabled: false,
+      onAll: () => {
+        setAll(sel.videos, true);
+        renderDetails();
+      },
+      onInvert: () => {
+        invertAll(sel.videos);
+        renderDetails();
+      },
+    });
     for (let i = 0; i < videoFiles.length; i++) {
       const row = document.createElement("div");
       row.className = "row";
@@ -733,28 +723,23 @@ async function renderDetails() {
       v.src = fileSrc(videoFiles[i]);
       videos.appendChild(v);
     }
+    el.details.appendChild(videos);
   }
-  el.details.appendChild(videos);
 
-  const pdfs = section("PDF文件（系统打开）");
   const pdfFiles = z.pdf_files ?? [];
-  addSelectAllInvert(pdfs, {
-    disabled: pdfFiles.length === 0,
-    onAll: () => {
-      setAll(sel.pdfFiles, true);
-      renderDetails();
-    },
-    onInvert: () => {
-      invertAll(sel.pdfFiles);
-      renderDetails();
-    },
-  });
-  if (!pdfFiles.length) {
-    const p = document.createElement("div");
-    p.className = "small";
-    p.textContent = "无PDF";
-    pdfs.appendChild(p);
-  } else {
+  if (pdfFiles.length > 0) {
+    const pdfs = section("PDF文件（系统打开）");
+    addSelectAllInvert(pdfs, {
+      disabled: false,
+      onAll: () => {
+        setAll(sel.pdfFiles, true);
+        renderDetails();
+      },
+      onInvert: () => {
+        invertAll(sel.pdfFiles);
+        renderDetails();
+      },
+    });
     for (let i = 0; i < pdfFiles.length; i++) {
       const row = document.createElement("div");
       row.className = "row";
@@ -782,28 +767,23 @@ async function renderDetails() {
       row.appendChild(label);
       pdfs.appendChild(row);
     }
+    el.details.appendChild(pdfs);
   }
-  el.details.appendChild(pdfs);
 
-  const pdfScreens = section("PDF页面截图");
   const pdfScreenFiles = z.pdf_page_screenshot_files ?? [];
-  addSelectAllInvert(pdfScreens, {
-    disabled: pdfScreenFiles.length === 0,
-    onAll: () => {
-      setAll(sel.pdfScreens, true);
-      renderDetails();
-    },
-    onInvert: () => {
-      invertAll(sel.pdfScreens);
-      renderDetails();
-    },
-  });
-  if (!pdfScreenFiles.length) {
-    const p = document.createElement("div");
-    p.className = "small";
-    p.textContent = "无PDF页面截图（导入后会自动生成；若PDF较大可能需要等待）";
-    pdfScreens.appendChild(p);
-  } else {
+  if (pdfScreenFiles.length > 0) {
+    const pdfScreens = section("PDF页面截图");
+    addSelectAllInvert(pdfScreens, {
+      disabled: false,
+      onAll: () => {
+        setAll(sel.pdfScreens, true);
+        renderDetails();
+      },
+      onInvert: () => {
+        invertAll(sel.pdfScreens);
+        renderDetails();
+      },
+    });
     const thumbs3 = document.createElement("div");
     thumbs3.className = "thumbs";
     for (let i = 0; i < pdfScreenFiles.length; i++) {
@@ -845,29 +825,24 @@ async function renderDetails() {
       thumbs3.appendChild(card);
     }
     pdfScreens.appendChild(thumbs3);
+    el.details.appendChild(pdfScreens);
   }
-  el.details.appendChild(pdfScreens);
 
   // Excel section
-  const excels = section("Excel文件");
   const excelFiles = z.excel_files ?? [];
-  addSelectAllInvert(excels, {
-    disabled: excelFiles.length === 0,
-    onAll: () => {
-      setAll(sel.excels, true);
-      renderDetails();
-    },
-    onInvert: () => {
-      invertAll(sel.excels);
-      renderDetails();
-    },
-  });
-  if (!excelFiles.length) {
-    const p = document.createElement("div");
-    p.className = "small";
-    p.textContent = "无Excel文件";
-    excels.appendChild(p);
-  } else {
+  if (excelFiles.length > 0) {
+    const excels = section("Excel文件");
+    addSelectAllInvert(excels, {
+      disabled: false,
+      onAll: () => {
+        setAll(sel.excels, true);
+        renderDetails();
+      },
+      onInvert: () => {
+        invertAll(sel.excels);
+        renderDetails();
+      },
+    });
     for (let i = 0; i < excelFiles.length; i++) {
       const card = document.createElement("div");
       card.className = "excel-card";
@@ -933,40 +908,35 @@ async function renderDetails() {
 
       excels.appendChild(card);
     }
+    el.details.appendChild(excels);
   }
-  el.details.appendChild(excels);
 
   // 附加 Word 文档区域
-  const additionalDocs = section("附加 Word 文档");
   const additionalDocxFiles = z.additional_docx_files ?? [];
-  addSelectAllInvert(additionalDocs, {
-    disabled: additionalDocxFiles.length === 0,
-    onAll: () => {
-      for (let i = 0; i < sel.additionalDocx.length; i++) {
-        sel.additionalDocx[i].includeText = true;
-        for (let j = 0; j < sel.additionalDocx[i].includeImages.length; j++) {
-          sel.additionalDocx[i].includeImages[j] = true;
+  if (additionalDocxFiles.length > 0) {
+    const additionalDocs = section("附加 Word 文档");
+    addSelectAllInvert(additionalDocs, {
+      disabled: false,
+      onAll: () => {
+        for (let i = 0; i < sel.additionalDocx.length; i++) {
+          sel.additionalDocx[i].includeText = true;
+          for (let j = 0; j < sel.additionalDocx[i].includeImages.length; j++) {
+            sel.additionalDocx[i].includeImages[j] = true;
+          }
         }
-      }
-      renderDetails();
-    },
-    onInvert: () => {
-      for (let i = 0; i < sel.additionalDocx.length; i++) {
-        sel.additionalDocx[i].includeText = !sel.additionalDocx[i].includeText;
-        for (let j = 0; j < sel.additionalDocx[i].includeImages.length; j++) {
-          sel.additionalDocx[i].includeImages[j] = !sel.additionalDocx[i].includeImages[j];
+        renderDetails();
+      },
+      onInvert: () => {
+        for (let i = 0; i < sel.additionalDocx.length; i++) {
+          sel.additionalDocx[i].includeText = !sel.additionalDocx[i].includeText;
+          for (let j = 0; j < sel.additionalDocx[i].includeImages.length; j++) {
+            sel.additionalDocx[i].includeImages[j] = !sel.additionalDocx[i].includeImages[j];
+          }
         }
-      }
-      renderDetails();
-    },
-  });
+        renderDetails();
+      },
+    });
 
-  if (!additionalDocxFiles.length) {
-    const p = document.createElement("div");
-    p.className = "small";
-    p.textContent = "无附加 Word 文档";
-    additionalDocs.appendChild(p);
-  } else {
     for (let i = 0; i < additionalDocxFiles.length; i++) {
       const doc = additionalDocxFiles[i];
       const card = document.createElement("div");
@@ -1137,8 +1107,8 @@ async function renderDetails() {
 
       additionalDocs.appendChild(card);
     }
+    el.details.appendChild(additionalDocs);
   }
-  el.details.appendChild(additionalDocs);
 }
 
 el.pickZipsBtn.onclick = async () => {
