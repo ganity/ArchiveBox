@@ -1,22 +1,72 @@
 use anyhow::{anyhow, Context, Result};
-use calamine::{open_workbook, Reader, Xls, Xlsx, Data};
+use calamine::{Reader, Xls, Xlsx};
 use docx_rs::*;
-use encoding_rs::{GBK, UTF_8};
+use encoding_rs::GBK;
+use image::{ImageFormat, GenericImageView};
 use once_cell::sync::Lazy;
 use quick_xml::events::Event;
 use quick_xml::Reader as XmlReader;
+use rayon::prelude::*;
 use regex::Regex;
-use rust_xlsxwriter::{Format, FormatAlign, Workbook};
+use rust_xlsxwriter::{Format, FormatAlign, Url, Workbook};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 use time::OffsetDateTime;
 use uuid::Uuid;
 use zip::{ZipArchive, ZipWriter};
 use zip::write::FileOptions;
+
+
+// 进度条相关结构体和函数
+
+/// 进度事件结构体
+#[derive(Debug, Clone, Serialize)]
+pub struct ProgressEvent {
+    pub operation_type: String,  // "import", "export_excel", "export_word"
+    pub current: usize,          // 当前项目
+    pub total: usize,            // 总项目数
+    pub step_name: String,       // 当前步骤名称
+    pub message: String,         // 详细消息
+    pub is_complete: bool,       // 是否完成
+}
+
+impl ProgressEvent {
+    pub fn new(operation_type: &str, current: usize, total: usize, step_name: &str, message: &str) -> Self {
+        Self {
+            operation_type: operation_type.to_string(),
+            current,
+            total,
+            step_name: step_name.to_string(),
+            message: message.to_string(),
+            is_complete: current >= total,
+        }
+    }
+
+    pub fn complete(operation_type: &str) -> Self {
+        Self {
+            operation_type: operation_type.to_string(),
+            current: 1,
+            total: 1,
+            step_name: "完成".to_string(),
+            message: "操作已完成".to_string(),
+            is_complete: true,
+        }
+    }
+}
+
+/// 发送进度事件到前端（用于AppHandle）
+fn emit_progress_handle(app: &tauri::AppHandle, event: ProgressEvent) -> Result<()> {
+    if let Some(window) = app.get_webview_window("main") {
+        window
+            .emit("progress_update", &event)
+            .context("发送进度事件失败")?;
+    }
+    Ok(())
+}
 
 
 // 文件嵌入相关结构体和函数
@@ -49,6 +99,7 @@ pub enum FileType {
 pub struct EmbeddingConfig {
     pub enabled: bool,
     pub max_file_size: usize,
+    pub max_files_per_zip: usize,  // 每个ZIP最大嵌入文件数量
     pub allowed_types: Vec<String>,
     pub exclude_patterns: Vec<String>,
 }
@@ -57,7 +108,8 @@ impl Default for EmbeddingConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_file_size: 50 * 1024 * 1024,  // 50MB
+            max_file_size: 10 * 1024 * 1024,  // 10MB (降低限制)
+            max_files_per_zip: 20,              // 每个ZIP最多20个文件
             allowed_types: vec![
                 "pdf".to_string(),
                 "mp4".to_string(),
@@ -122,22 +174,94 @@ fn build_enhanced_summary_docx(
             }
         }
 
-        // 直接显示图片，删除"图片"标题
-        for img_path in &z.image_files {
-            let bytes = fs::read(img_path)
-                .with_context(|| format!("读取图片失败: {}", img_path))?;
-            let pic = Pic::new(&bytes);
-            docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_image(pic)));
+        // 处理附加 docx 内容
+        if !z.additional_docx_files.is_empty() {
+            for additional in &z.additional_docx_files {
+                // 如果有结构化字段，优先展示
+                if !additional.fields.instruction_no.is_empty() ||
+                   !additional.fields.title.is_empty() ||
+                   !additional.fields.issued_at.is_empty() {
+                    if !additional.fields.instruction_no.is_empty() {
+                        docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_text(format!(
+                            "指令编号: {}",
+                            additional.fields.instruction_no
+                        ))));
+                    }
+                    if !additional.fields.title.is_empty() {
+                        docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_text(format!(
+                            "指令标题: {}",
+                            additional.fields.title
+                        ))));
+                    }
+                    if !additional.fields.issued_at.is_empty() {
+                        docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_text(format!(
+                            "下发时间: {}",
+                            additional.fields.issued_at
+                        ))));
+                    }
+                    if !additional.fields.content.trim().is_empty() {
+                        docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_text("指令内容:")));
+                        for line in additional.fields.content.lines() {
+                            let trimmed_line = line.trim();
+                            if !trimmed_line.is_empty() {
+                                docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_text(trimmed_line)));
+                            } else {
+                                docx = docx.add_paragraph(Paragraph::new());
+                            }
+                        }
+                    }
+                }
+
+                // 展示完整文本内容
+                if !additional.full_text.trim().is_empty() {
+                    for line in additional.full_text.lines() {
+                        let trimmed_line = line.trim();
+                        if !trimmed_line.is_empty() {
+                            docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_text(trimmed_line)));
+                        } else {
+                            docx = docx.add_paragraph(Paragraph::new());
+                        }
+                    }
+                }
+
+                // 附加文档的图片（直接显示，不加标题）
+                if !additional.image_files.is_empty() {
+                    for img_path in &additional.image_files {
+                        let bytes = fs::read(img_path)
+                            .with_context(|| format!("读取附加docx图片失败: {}", img_path))?;
+                        // 缩放图片到 600x800，质量 85
+                        let resized_bytes = resize_image_to_jpeg(&bytes, 600, 800, 85)?;
+                        let pic = Pic::new(&resized_bytes);
+                        docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_image(pic)));
+                    }
+                }
+
+                // 分隔线
+                docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_text("— — —")));
+            }
         }
 
-        // 直接显示PDF图片，删除"PDF页面图片:"标题
-        
-        // 直接显示PDF截图，删除"PDF页面截图:"标题
-        for img_path in &z.pdf_page_screenshot_files {
-            let bytes = fs::read(img_path)
-                .with_context(|| format!("读取PDF页面截图失败: {}", img_path))?;
-            let pic = Pic::new(&bytes);
-            docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_image(pic)));
+        // 并行处理所有图片
+        let mut all_images = z.image_files.clone();
+        all_images.extend_from_slice(&z.pdf_page_screenshot_files);
+
+        if !all_images.is_empty() {
+            println!("开始并行处理 {} 张图片...", all_images.len());
+            let processed_images = process_images_parallel(
+                &all_images,
+                600,
+                800,
+                85,
+                move |idx, total, filename| {
+                    println!("处理图片 {}/{}: {}", idx + 1, total, filename);
+                }
+            ).with_context(|| "并行处理图片失败")?;
+
+            for (_path, resized_bytes) in processed_images {
+                let pic = Pic::new(&resized_bytes);
+                docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_image(pic)));
+            }
+            println!("✓ 图片处理完成");
         }
 
         // 添加章节标记段落（用于后续插入OLE对象）
@@ -274,28 +398,7 @@ fn get_content_type(filename: &str) -> String {
     }
 }
 
-fn get_file_icon(file_type: &FileType) -> &'static str {
-    match file_type {
-        FileType::Video => "🎥",
-        FileType::PDF => "📄",
-        FileType::Image => "🖼️",
-        FileType::Document => "📝",
-        FileType::Excel => "📊",
-        FileType::ZIP => "📦",
-        FileType::Other(_) => "📎",
-    }
-}
 
-/// 检查是否为文本文件
-fn is_text_file(content_type: &str) -> bool {
-    content_type.starts_with("text/") ||
-    content_type.contains("plain") ||
-    content_type.contains("rtf") ||
-    content_type.contains("html") ||
-    content_type.contains("xml") ||
-    content_type.contains("json") ||
-    content_type.contains("csv")
-}
 
 /// 构建带嵌入文件的 DOCX（真正的 OLE 嵌入）
 fn build_docx_with_embeddings(
@@ -340,187 +443,7 @@ fn build_docx_with_embeddings(
     }
 }
 
-/// 尝试真正的文件嵌入
-fn attempt_file_embedding(
-    base_docx_bytes: &[u8],
-    embedded_files: &[EmbeddedFile]
-) -> Result<Vec<u8>> {
-    // 如果没有文件要嵌入，直接返回
-    if embedded_files.is_empty() {
-        return Ok(base_docx_bytes.to_vec());
-    }
 
-    println!("开始真正的文件嵌入...");
-
-    // 暂时返回基础文档，避免损坏现有功能
-    // OpenXML操作非常复杂，容易损坏文档结构
-    println!("⚠ OpenXML文件嵌入操作复杂，为确保文档完整性，暂时使用显示模式");
-    println!("  显示的附件信息：");
-    for file in embedded_files {
-        println!("  - {} ({} bytes)", file.name, file.data.len());
-    }
-
-    Err(anyhow!("使用简化显示模式确保文档完整性"))
-}
-
-/// 生成嵌入文件的 Content_Types.xml
-fn generate_content_types_xml(embedded_files: &[EmbeddedFile]) -> String {
-    let mut types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-    <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
-    <Default Extension="xml" ContentType="application/xml"/>
-    <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
-"#.to_string();
-
-    // 添加嵌入文件的类型定义
-    for file in embedded_files {
-        let embed_path = format!("/word/embeddings/{}.bin", file.id);
-        types.push_str(&format!(
-            r#"    <Override PartName="{}" ContentType="{}"/>
-"#, embed_path, file.content_type));
-    }
-
-    types.push_str("</Types>");
-    types
-}
-
-/// 生成嵌入文件的 relationships.xml
-fn generate_relationships_xml(embedded_files: &[EmbeddedFile]) -> String {
-    let mut rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-"#.to_string();
-
-    // 添加嵌入文件的关系
-    for (index, file) in embedded_files.iter().enumerate() {
-        let r_id = format!("rId{}", index + 1);
-        let target = format!("embeddings/{}.bin", file.id);
-        rels.push_str(&format!(
-            r#"    <Relationship Id="{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject" Target="{}"/>
-"#, r_id, target));
-    }
-
-    rels.push_str("</Relationships>");
-    rels
-}
-
-/// 生成包含嵌入文件的Content_Types.xml
-fn build_content_types_with_embeds(embedded_files: &[EmbeddedFile]) -> String {
-    let mut types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-    <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
-    <Default Extension="xml" ContentType="application/xml"/>
-    <Default Extension="bin" ContentType="application/vnd.openxmlformats-officedocument.oleObject"/>
-    <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
-    <Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
-    <Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/>
-    <Override PartName="/word/fontTable.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.fontTable+xml"/>
-    <Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering.xml"/>
-    <Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>
-    <Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>
-    <Override PartName="/word/webSettings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.webSettings+xml"/>
-"#.to_string();
-
-    // 添加嵌入文件的类型定义
-    for file in embedded_files {
-        let embed_path = format!("/word/embeddings/{}",
-            sanitize_filename(&format!("{}.{}",
-                Path::new(&file.name).file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy(),
-                Path::new(&file.name)
-                    .extension()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-            ))
-        );
-
-        types.push_str(&format!(
-            r#"    <Override PartName="{}" ContentType="{}"/>
-"#, embed_path, file.content_type));
-    }
-
-    types.push_str("</Types>");
-    types
-}
-
-/// 在document.xml中添加嵌入对象引用
-fn add_embedded_objects_to_document(document_xml: &str, embedded_files: &[EmbeddedFile]) -> Result<String> {
-    // 找到body标签的结束位置，并在那里插入嵌入对象
-    let body_end_pattern = r"</w:body>";
-
-    if !document_xml.contains(body_end_pattern) {
-        return Err(anyhow!("文档中未找到body结束标签"));
-    }
-
-    let mut objects_xml = String::new();
-
-    for (_, file) in embedded_files.iter().enumerate() {
-        let file_icon = match file.file_type {
-            FileType::PDF => "📄",
-            FileType::Video => "🎥",
-            FileType::ZIP => "📦",
-            _ => "📎"
-        };
-
-        // 创建简化的嵌入对象段落 - 使用简单的超链接方式，这在Word中更可靠
-        objects_xml.push_str(&format!(
-            r#"<w:p><w:r><w:rPr><w:color w:val="0000FF"/><w:u w:val="single"/></w:rPr><w:t>{icon} {name} (双击打开附件)</w:t></w:r></w:p>"#,
-            icon = file_icon,
-            name = file.name
-        ));
-    }
-
-    // 替换body结束标签
-    let modified_document = document_xml.replace(body_end_pattern, &format!("{}\n{}", objects_xml, body_end_pattern));
-
-    Ok(modified_document)
-}
-
-/// 生成包含嵌入文件的关系文档
-fn build_relationships_with_embeds(embedded_files: &[EmbeddedFile]) -> String {
-    let mut rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-"#.to_string();
-
-    // 添加嵌入文件的关系
-    for (index, file) in embedded_files.iter().enumerate() {
-        let r_id = format!("rId{}", index + 1);
-        let safe_filename = sanitize_filename(&format!("{}.{}",
-            Path::new(&file.name).file_stem()
-                .unwrap_or_default()
-                .to_string_lossy(),
-            Path::new(&file.name)
-                .extension()
-                .unwrap_or_default()
-                .to_string_lossy()
-        ));
-        let target = format!("embeddings/{}", safe_filename);
-
-        rels.push_str(&format!(
-            r#"    <Relationship Id="{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject" Target="{}"/>
-"#, r_id, target));
-    }
-
-    rels.push_str("</Relationships>");
-    rels
-}
-
-/// 清理文件名，移除不安全字符
-fn sanitize_filename(filename: &str) -> String {
-    let unsafe_chars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
-    let mut result = String::new();
-
-    for c in filename.chars() {
-        if unsafe_chars.contains(&c) {
-            // 用下划线替换不安全字符
-            result.push('_');
-        } else {
-            result.push(c);
-        }
-    }
-
-    result
-}
 
 // ==================== OLE 嵌入核心功能 ====================
 
@@ -735,19 +658,6 @@ fn create_comp_obj_stream(_filename: &str) -> Vec<u8> {
     data
 }
 
-/// 写入带长度前缀的 UTF-16 字符串
-fn write_utf16_length_prefixed_string(buffer: &mut Vec<u8>, s: &str) {
-    let utf16: Vec<u16> = s.encode_utf16().collect();
-    let byte_len = (utf16.len() * 2) as u32;
-
-    // 写入长度（字节数）
-    buffer.extend_from_slice(&byte_len.to_le_bytes());
-
-    // 写入 UTF-16 字符串
-    for code_unit in utf16 {
-        buffer.extend_from_slice(&code_unit.to_le_bytes());
-    }
-}
 
 /// 获取对应文件类型的 EMF 图标
 /// 智能截断文件名使其适合指定的最大字节数（UTF-16LE编码）
@@ -1120,6 +1030,16 @@ struct WordFields {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct AdditionalDocx {
+    id: String,
+    name: String,
+    file_path: String,
+    fields: WordFields,
+    full_text: String,
+    image_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ZipSummary {
     id: String,
     filename: String,
@@ -1130,6 +1050,8 @@ struct ZipSummary {
     include_original_zip: bool,
     status: String,
     word: WordFields,
+    #[serde(default)]
+    additional_docx_files: Vec<AdditionalDocx>,
     has_video: bool,
     has_sample: bool,
     video_entries: Vec<String>,
@@ -1153,6 +1075,13 @@ struct AppState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AdditionalDocxSelection {
+    docx_index: usize,
+    include_text: bool,
+    selected_image_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ExportZipSelection {
     zip_id: String,
     include: bool,
@@ -1162,6 +1091,8 @@ struct ExportZipSelection {
     selected_pdf_indices: Vec<usize>,
     selected_excel_indices: Vec<usize>,
     selected_pdf_page_screenshot_indices: Vec<usize>,
+    #[serde(default)]
+    selected_additional_docx: Vec<AdditionalDocxSelection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1245,12 +1176,32 @@ fn pick_zip_files() -> Result<Vec<String>, String> {
 
 #[tauri::command]
 fn import_zips(app: tauri::AppHandle, state: State<'_, AppState>, paths: Vec<String>) -> Result<BatchSummary, String> {
+    let total_zips = paths.len();
+
+    // 发送开始进度事件
+    let start_event = ProgressEvent::new("import", 0, total_zips, "开始导入", "正在准备导入ZIP文件");
+    if let Err(e) = emit_progress_handle(&app, start_event) {
+        eprintln!("发送进度事件失败: {}", e);
+    }
+
     let now = OffsetDateTime::now_utc();
     let batch_id = format!("batch_{}", now.unix_timestamp());
     let batch_dir = batch_dir(&app, &batch_id).map_err(err_to_string)?;
 
     let mut zips = Vec::new();
-    for p in paths {
+    for (index, p) in paths.into_iter().enumerate() {
+        // 发送当前ZIP处理进度
+        let progress_event = ProgressEvent::new(
+            "import",
+            index + 1,
+            total_zips,
+            "处理ZIP文件",
+            &format!("正在处理: {}", safe_basename(&p))
+        );
+        if let Err(e) = emit_progress_handle(&app, progress_event) {
+            eprintln!("发送进度事件失败: {}", e);
+        }
+
         let source_path = PathBuf::from(&p);
         let filename = source_path
             .file_name()
@@ -1276,6 +1227,7 @@ fn import_zips(app: tauri::AppHandle, state: State<'_, AppState>, paths: Vec<Str
             include_original_zip: false,
             status: "processing".to_string(),
             word: WordFields::default(),
+            additional_docx_files: vec![],
             has_video: false,
             has_sample: false,
             video_entries: vec![],
@@ -1316,6 +1268,31 @@ fn import_zips(app: tauri::AppHandle, state: State<'_, AppState>, paths: Vec<Str
             continue;
         }
 
+        // 处理附加 docx
+        if !zip_scan.additional_docx_entries.is_empty() {
+            match process_additional_docx(&batch_dir, &zip_id, &stored_zip_path, &zip_scan.additional_docx_entries) {
+                Ok(additional_docx) => {
+                    summary.additional_docx_files = additional_docx;
+                }
+                Err(e) => {
+                    println!("警告：处理附加docx失败: {}", e);
+                    summary.additional_docx_files = vec![];
+                }
+            }
+        }
+
+        // 处理嵌套 ZIP
+        if !zip_scan.nested_zip_entries.is_empty() {
+            match process_nested_zip(&batch_dir, &zip_id, &stored_zip_path, &zip_scan.nested_zip_entries, &mut summary) {
+                Ok(_) => {
+                    println!("成功处理 {} 个嵌套ZIP", zip_scan.nested_zip_entries.len());
+                }
+                Err(e) => {
+                    println!("警告：处理嵌套ZIP失败: {}", e);
+                }
+            }
+        }
+
         summary.status = "completed".to_string();
 
         zips.push(summary);
@@ -1332,6 +1309,13 @@ fn import_zips(app: tauri::AppHandle, state: State<'_, AppState>, paths: Vec<Str
         .map_err(err_to_string)?;
 
     *state.last_batch_id.lock().unwrap() = Some(batch_id);
+
+    // 发送完成进度事件
+    let complete_event = ProgressEvent::complete("import");
+    if let Err(e) = emit_progress_handle(&app, complete_event) {
+        eprintln!("发送进度事件失败: {}", e);
+    }
+
     Ok(batch)
 }
 
@@ -1361,8 +1345,15 @@ fn export_excel_with_selection(
 }
 
 fn export_excel_impl(app: &tauri::AppHandle, batch: &BatchSummary) -> Result<String, String> {
+    let total_rows = batch.zips.len();
+
+    // 发送开始进度事件
+    let start_event = ProgressEvent::new("export_excel", 0, total_rows, "开始导出Excel", "正在准备数据");
+    if let Err(e) = emit_progress_handle(app, start_event) {
+        eprintln!("发送进度事件失败: {}", e);
+    }
+
     let now = OffsetDateTime::now_utc();
-    let _ = app;
     let out = prompt_save_path(default_export_excel_name(now), "xlsx", "Excel")?;
 
     let mut workbook = Workbook::new();
@@ -1381,6 +1372,7 @@ fn export_excel_impl(app: &tauri::AppHandle, batch: &BatchSummary) -> Result<Str
         "下发时间",
         "任务执行",
         "备注",
+        "原始ZIP",
     ];
     for (i, h) in headers.iter().enumerate() {
         worksheet
@@ -1389,6 +1381,18 @@ fn export_excel_impl(app: &tauri::AppHandle, batch: &BatchSummary) -> Result<Str
     }
 
     for (idx, z) in batch.zips.iter().enumerate() {
+        // 发送行处理进度
+        let progress_event = ProgressEvent::new(
+            "export_excel",
+            idx + 1,
+            total_rows,
+            "导出数据行",
+            &format!("正在处理: {}", z.word.instruction_no)
+        );
+        if let Err(e) = emit_progress_handle(app, progress_event) {
+            eprintln!("发送进度事件失败: {}", e);
+        }
+
         let row = (idx + 1) as u32;
         let date = format!(
             "{:04}{:02}{:02}",
@@ -1396,17 +1400,27 @@ fn export_excel_impl(app: &tauri::AppHandle, batch: &BatchSummary) -> Result<Str
             now.month() as u8,
             now.day()
         );
-        let sample_kind = if !z.video_files.is_empty() || !z.video_entries.is_empty() {
-            "视频"
-        } else if !z.image_files.is_empty()
+
+        // 判断是否有图文类内容（PDF/图片/附加docx/Excel）
+        let has_image_text = !z.image_files.is_empty()
+            || !z.pdf_files.is_empty()
             || !z.pdf_page_screenshot_files.is_empty()
             || !z.excel_files.is_empty()
-        {
-            "图文"
-        } else {
-            ""
+            || !z.additional_docx_files.is_empty();
+
+        // 判断是否有视频
+        let has_video = !z.video_files.is_empty() || !z.video_entries.is_empty();
+
+        // 根据内容类型组合判断
+        let sample_kind = match (has_image_text, has_video) {
+            (true, true) => "图文+视频",
+            (true, false) => "图文",
+            (false, true) => "视频",
+            (false, false) => "否",  // 没有任何附件时显示"否"
         };
-        let has_sample = if sample_kind.is_empty() { "否" } else { "是" };
+
+        // "是否有样本" 列始终根据 sample_kind 内容判断
+        let has_sample = if sample_kind == "否" { "否" } else { "是" };
 
         worksheet
             .write_number(row, 0, (idx + 1) as f64)
@@ -1435,15 +1449,60 @@ fn export_excel_impl(app: &tauri::AppHandle, batch: &BatchSummary) -> Result<Str
         worksheet
             .write_string(row, 8, z.word.issued_at.trim())
             .map_err(err_to_string)?;
+
+        // 根据标题内容智能判断任务执行状态
+        let title = z.word.title.trim().to_lowercase();
+        let task_status = {
+            // 条件a：执行类关键词（优先级高）
+            let execution_keywords = ["人工审核", "删除", "禁言", "样本查删", "拦截", "反馈", "溯源", "加私", "专项", "清理", "限流", "屏蔽"];
+            let is_execution = execution_keywords.iter().any(|&keyword| title.contains(keyword));
+
+            if is_execution {
+                "已执行"
+            } else {
+                // 条件b：接收类关键词（优先级低）
+                let receive_keywords = ["工作", "指令", "通知", "提示", "压后台"];
+                let is_receive = receive_keywords.iter().any(|&keyword| title.contains(keyword));
+
+                if is_receive {
+                    "已签收"
+                } else {
+                    ""  // 无匹配关键词时保持字段为空
+                }
+            }
+        };
+
         worksheet
-            .write_string(row, 9, "已完成")
+            .write_string(row, 9, task_status)
             .map_err(err_to_string)?;
         worksheet.write_string(row, 10, "").map_err(err_to_string)?;
+
+        // 添加原始ZIP文件路径（直接显示为文本，用户可以复制路径手动打开）
+        // Windows 平台：尝试创建超链接；macOS 平台：直接显示路径文本
+        if cfg!(target_os = "windows") {
+            // Windows: 尝试使用 file:// 超链接
+            let file_url = format!("file:///{}", z.source_path.replace("\\", "/"));
+            worksheet
+                .write_url_with_text(row, 11, Url::new(&file_url), &z.source_path)
+                .map_err(err_to_string)?;
+        } else {
+            // macOS: 直接显示文件路径作为文本（Excel for Mac 对 file:// 支持不好）
+            worksheet
+                .write_string(row, 11, &z.source_path)
+                .map_err(err_to_string)?;
+        }
     }
 
     workbook
         .save(out.to_string_lossy().as_ref())
         .map_err(err_to_string)?;
+
+    // 发送完成进度事件
+    let complete_event = ProgressEvent::complete("export_excel");
+    if let Err(e) = emit_progress_handle(app, complete_event) {
+        eprintln!("发送进度事件失败: {}", e);
+    }
+
     Ok(out.to_string_lossy().to_string())
 }
 
@@ -1480,22 +1539,97 @@ fn export_bundle_zip_with_selection(
         return Err("未选择任何ZIP用于导出".to_string());
     }
 
-    let now = OffsetDateTime::now_utc();
-    // 修改：直接保存为.docx文件，不再压缩为.zip
-    let out = prompt_save_path(default_export_bundle_name(now), "docx", "Word文档")?;
+    let total_steps = 4; // 准备 -> 收集文件 -> 生成文档 -> 保存
+    let current_zip_count = batch.zips.len();
 
     // 始终使用文件嵌入功能
     println!("=== 开始文件嵌入导出 ===");
-    println!("1. 收集需要嵌入的文件...");
+
+    // 立即询问保存位置，让用户能够快速响应
+    // 文件对话框会阻塞UI，但这是必要的用户交互
+    let now = OffsetDateTime::now_utc();
+    let out = prompt_save_path(default_export_bundle_name(now), "docx", "Word文档")?;
+
+    // 发送开始进度事件（在文件对话框完成后）
+    let start_event = ProgressEvent::new(
+        "export_word",
+        0,
+        total_steps * current_zip_count.max(1),
+        "开始导出Word",
+        "正在准备导出Word文档"
+    );
+    if let Err(e) = emit_progress_handle(&app, start_event) {
+        eprintln!("发送进度事件失败: {}", e);
+    }
+
+    // 步骤1: 收集需要嵌入的文件
+    for (idx, z) in batch.zips.iter().enumerate() {
+        let progress_event = ProgressEvent::new(
+            "export_word",
+            idx + 1,
+            total_steps * current_zip_count,
+            "收集文件",
+            &format!("正在处理: {}", z.word.instruction_no)
+        );
+        if let Err(e) = emit_progress_handle(&app, progress_event) {
+            eprintln!("发送进度事件失败: {}", e);
+        }
+    }
+
     let (docx, embedded_files) = build_enhanced_summary_docx(&batch, true).map_err(err_to_string)?;
 
-    println!("2. 生成基础Word文档...");
-    println!("3. 开始嵌入文件到Word文档...");
+    // 步骤2: 生成基础Word文档
+    let progress_event = ProgressEvent::new(
+        "export_word",
+        current_zip_count + 1,
+        total_steps * current_zip_count,
+        "生成基础文档",
+        "正在生成基础Word文档"
+    );
+    if let Err(e) = emit_progress_handle(&app, progress_event) {
+        eprintln!("发送进度事件失败: {}", e);
+    }
+
+    // 步骤3: 嵌入文件到Word文档
+    let progress_event = ProgressEvent::new(
+        "export_word",
+        current_zip_count + 2,
+        total_steps * current_zip_count,
+        "嵌入文件",
+        &format!("正在嵌入 {} 个文件", embedded_files.len())
+    );
+    if let Err(e) = emit_progress_handle(&app, progress_event) {
+        eprintln!("发送进度事件失败: {}", e);
+    }
+
     let docx_bytes = build_docx_with_embeddings(docx, &embedded_files).map_err(err_to_string)?;
 
+    // 步骤4: 保存文档
+    let progress_event = ProgressEvent::new(
+        "export_word",
+        current_zip_count + 3,
+        total_steps * current_zip_count,
+        "保存文档",
+        "正在保存Word文档"
+    );
+    if let Err(e) = emit_progress_handle(&app, progress_event) {
+        eprintln!("发送进度事件失败: {}", e);
+    }
+
     // 直接保存docx文件，不再创建zip包
-    println!("4. 保存Word文档到: {}", out.display());
     fs::write(&out, docx_bytes).map_err(err_to_string)?;
+
+    // 发送完成进度事件
+    let complete_event = ProgressEvent::new(
+        "export_word",
+        total_steps * current_zip_count,
+        total_steps * current_zip_count,
+        "完成",
+        &format!("Word文档导出完成，包含 {} 个嵌入文件", embedded_files.len())
+    );
+    if let Err(e) = emit_progress_handle(&app, complete_event) {
+        eprintln!("发送进度事件失败: {}", e);
+    }
 
     println!("✓ Word文档导出完成！");
     println!("生成的Word文档包含 {} 个嵌入文件", embedded_files.len());
@@ -1563,6 +1697,32 @@ fn apply_bundle_selection(batch: &BatchSummary, selection: ExportBundleSelection
         }
         z2.excel_files = selected_excels;
 
+        // 过滤附加 docx（根据细粒度选择）
+        let mut selected_additional_docx = Vec::new();
+        for docx_sel in &sel.selected_additional_docx {
+            if let Some(doc) = z.additional_docx_files.get(docx_sel.docx_index) {
+                let mut filtered_doc = doc.clone();
+
+                // 如果不包含文本，清空 full_text 和 fields
+                if !docx_sel.include_text {
+                    filtered_doc.full_text = String::new();
+                    filtered_doc.fields = WordFields::default();
+                }
+
+                // 过滤图片
+                let mut selected_images = Vec::new();
+                for &img_idx in &docx_sel.selected_image_indices {
+                    if let Some(img_path) = doc.image_files.get(img_idx) {
+                        selected_images.push(img_path.clone());
+                    }
+                }
+                filtered_doc.image_files = selected_images;
+
+                selected_additional_docx.push(filtered_doc);
+            }
+        }
+        z2.additional_docx_files = selected_additional_docx;
+
         out.push(z2);
     }
 
@@ -1579,11 +1739,56 @@ fn apply_bundle_selection(batch: &BatchSummary, selection: ExportBundleSelection
 #[derive(Debug, Clone)]
 struct ZipScan {
     docx_entry: String,
+    additional_docx_entries: Vec<usize>,  // 附加docx的ZIP索引列表
     video_entries: Vec<usize>,  // 存储ZIP中的索引
     image_entries: Vec<usize>,
     pdf_entries: Vec<usize>,
     excel_entries: Vec<usize>,
+    nested_zip_entries: Vec<usize>,  // 嵌套ZIP的索引列表
     has_sample: bool,
+}
+
+/// 识别主 docx：优先匹配与 ZIP 文件名相同的 docx
+fn identify_main_docx(zip_filename: &str, all_docx_names: &[String]) -> Option<String> {
+    if all_docx_names.is_empty() {
+        return None;
+    }
+
+    // 提取 ZIP 文件名（不含扩展名和路径）
+    let zip_stem = Path::new(zip_filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    // 尝试精确匹配（忽略大小写）
+    for docx_name in all_docx_names {
+        let docx_stem = Path::new(docx_name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        if docx_stem == zip_stem {
+            return Some(docx_name.clone());
+        }
+    }
+
+    // 尝试部分匹配：ZIP 名包含 docx 名或 docx 名包含 ZIP 名
+    for docx_name in all_docx_names {
+        let docx_stem = Path::new(docx_name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        if zip_stem.contains(&docx_stem) || docx_stem.contains(&zip_stem) {
+            return Some(docx_name.clone());
+        }
+    }
+
+    // 如果都没匹配，返回第一个 docx
+    Some(all_docx_names[0].clone())
 }
 
 /// 解码ZIP文件名（处理中文乱码）
@@ -1607,16 +1812,85 @@ fn decode_zip_filename(name_bytes: &[u8]) -> String {
     String::from_utf8_lossy(name_bytes).to_string()
 }
 
+/// 缩放图片并转换为 JPEG 格式以减小文件体积（优化版本）
+/// max_width: 最大宽度（像素）
+/// max_height: 最大高度（像素）
+/// quality: JPEG 质量（1-100）
+fn resize_image_to_jpeg(image_bytes: &[u8], max_width: u32, max_height: u32, _quality: u8) -> Result<Vec<u8>> {
+    // 加载图片
+    let img = image::load_from_memory(image_bytes)
+        .context("无法加载图片")?;
+
+    let (orig_width, orig_height) = img.dimensions();
+
+    // 计算缩放后的尺寸（保持纵横比）
+    let (new_width, new_height) = if orig_width <= max_width && orig_height <= max_height {
+        // 图片已经足够小，不需要缩放
+        (orig_width, orig_height)
+    } else {
+        let width_ratio = max_width as f32 / orig_width as f32;
+        let height_ratio = max_height as f32 / orig_height as f32;
+        let ratio = width_ratio.min(height_ratio);
+
+        ((orig_width as f32 * ratio) as u32, (orig_height as f32 * ratio) as u32)
+    };
+
+    // 使用更快的滤波器进行缩放
+    let resized = if new_width != orig_width || new_height != orig_height {
+        img.resize(new_width, new_height, image::imageops::FilterType::Nearest)
+    } else {
+        img
+    };
+
+    // 转换为 JPEG 格式
+    let mut jpeg_bytes = Vec::new();
+    let mut cursor = Cursor::new(&mut jpeg_bytes);
+
+    resized.write_to(&mut cursor, ImageFormat::Jpeg)
+        .context("无法将图片转换为JPEG")?;
+
+    Ok(jpeg_bytes)
+}
+
+/// 并行处理多个图片文件
+fn process_images_parallel(
+    image_paths: &[String],
+    max_width: u32,
+    max_height: u32,
+    quality: u8,
+    progress_callback: impl Fn(usize, usize, &str) + Send + Sync,
+) -> Result<Vec<(String, Vec<u8>)>> {
+    let paths: Vec<String> = image_paths.to_vec();
+    let count = paths.len();
+
+    let results: Result<Vec<_>> = paths
+        .into_par_iter()
+        .enumerate()
+        .map(|(index, path)| {
+            progress_callback(index, count, &safe_basename(&path));
+
+            let bytes = fs::read(&path)
+                .with_context(|| format!("读取图片失败: {}", path))?;
+            let resized_bytes = resize_image_to_jpeg(&bytes, max_width, max_height, quality)?;
+
+            Ok((path, resized_bytes))
+        })
+        .collect();
+
+    results
+}
+
 fn scan_zip(zip_path: &Path) -> Result<ZipScan> {
     let f = fs::File::open(zip_path)?;
     let mut zip = ZipArchive::new(f)?;
 
-    let mut docx_entry: Option<String> = None;
+    let mut all_docx_entries = Vec::new();  // 收集所有 docx 的索引和名称
     let mut has_sample = false;
     let mut video_entries = Vec::new();
     let mut image_entries = Vec::new();
     let mut pdf_entries = Vec::new();
     let mut excel_entries = Vec::new();
+    let mut nested_zip_entries = Vec::new();  // 收集嵌套 ZIP 的索引
 
     for i in 0..zip.len() {
         let file = zip.by_index(i)?;
@@ -1625,10 +1899,7 @@ fn scan_zip(zip_path: &Path) -> Result<ZipScan> {
         let lower = name.to_ascii_lowercase();
 
         if lower.ends_with(".docx") {
-            if docx_entry.is_some() {
-                return Err(anyhow!("ZIP内发现多个docx，不符合前提"));
-            }
-            docx_entry = Some(name);
+            all_docx_entries.push((i, name));  // 收集所有 docx
             continue;
         }
 
@@ -1651,15 +1922,45 @@ fn scan_zip(zip_path: &Path) -> Result<ZipScan> {
             image_entries.push(i);
         } else if lower.ends_with(".xlsx") || lower.ends_with(".xls") {
             excel_entries.push(i);
+        } else if lower.ends_with(".zip") {
+            nested_zip_entries.push(i);  // 收集嵌套 ZIP
+        }
+    }
+
+    if all_docx_entries.is_empty() {
+        return Err(anyhow!("ZIP内未找到docx"));
+    }
+
+    // 识别主 docx
+    let zip_filename = zip_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown.zip");
+
+    let all_docx_names: Vec<String> = all_docx_entries.iter().map(|(_, name)| name.clone()).collect();
+    let main_docx_name = identify_main_docx(zip_filename, &all_docx_names)
+        .ok_or_else(|| anyhow!("无法识别主docx"))?;
+
+    // 分离主 docx 和附加 docx
+    let mut main_docx_entry = None;
+    let mut additional_docx_entries = Vec::new();
+
+    for (idx, name) in all_docx_entries {
+        if name == main_docx_name {
+            main_docx_entry = Some(name);
+        } else {
+            additional_docx_entries.push(idx);
         }
     }
 
     Ok(ZipScan {
-        docx_entry: docx_entry.ok_or_else(|| anyhow!("ZIP内未找到docx"))?,
+        docx_entry: main_docx_entry.ok_or_else(|| anyhow!("主docx丢失"))?,
+        additional_docx_entries,
         video_entries,
         image_entries,
         pdf_entries,
         excel_entries,
+        nested_zip_entries,
         has_sample,
     })
 }
@@ -1744,6 +2045,258 @@ fn extract_preview_files(
         file.read_to_end(&mut buf)?;
         fs::write(&out, buf)?;
         summary.excel_files.push(out.to_string_lossy().to_string());
+    }
+
+    Ok(())
+}
+
+/// 从 docx 中提取图片
+fn extract_images_from_docx(docx_bytes: &[u8], output_dir: &Path) -> Result<Vec<String>> {
+    let cursor = Cursor::new(docx_bytes);
+    let mut zip = ZipArchive::new(cursor)?;
+    let mut image_paths = Vec::new();
+
+    fs::create_dir_all(output_dir)?;
+
+    for i in 0..zip.len() {
+        let mut file = zip.by_index(i)?;
+        let name = file.name();
+
+        // 只提取 word/media/ 下的图片
+        if name.starts_with("word/media/") {
+            let lower = name.to_ascii_lowercase();
+            if lower.ends_with(".png") || lower.ends_with(".jpg") ||
+               lower.ends_with(".jpeg") || lower.ends_with(".gif") {
+                let basename = Path::new(name)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("image.png");
+
+                let out_path = unique_path(output_dir, basename);
+                let mut buf = Vec::new();
+                file.read_to_end(&mut buf)?;
+                fs::write(&out_path, buf)?;
+                image_paths.push(out_path.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    Ok(image_paths)
+}
+
+/// 提取 docx 的完整文本内容（所有段落）
+fn extract_full_text_from_docx(docx_bytes: &[u8]) -> Result<String> {
+    let cursor = Cursor::new(docx_bytes);
+    let mut zip = ZipArchive::new(cursor)?;
+    let mut document_xml = zip
+        .by_name("word/document.xml")
+        .context("docx缺少word/document.xml")?;
+    let mut xml = String::new();
+    document_xml.read_to_string(&mut xml)?;
+
+    // 复用现有的段落文本提取逻辑
+    let text = extract_paragraph_texts(&xml)?;
+
+    Ok(text)
+}
+
+/// 处理附加 docx 文件
+fn process_additional_docx(
+    batch_dir: &Path,
+    zip_id: &str,
+    zip_path: &Path,
+    additional_indices: &[usize],
+) -> Result<Vec<AdditionalDocx>> {
+    let f = fs::File::open(zip_path)?;
+    let mut zip = ZipArchive::new(f)?;
+    let mut results = Vec::new();
+
+    for &index in additional_indices {
+        let mut file = zip.by_index(index)?;
+        let name = decode_zip_filename(file.name_raw());
+
+        // 读取 docx 内容
+        let mut docx_bytes = Vec::new();
+        file.read_to_end(&mut docx_bytes)?;
+
+        // 解析结构化字段（可能失败，不影响整体流程）
+        let fields = extract_fields_from_docx(&docx_bytes)
+            .unwrap_or_else(|_| WordFields::default());
+
+        // 提取完整文本内容
+        let full_text = extract_full_text_from_docx(&docx_bytes)
+            .unwrap_or_else(|_| String::from("无法提取文本内容"));
+
+        // 提取图片
+        let docx_id = Uuid::new_v4().to_string();
+        let images_dir = batch_dir
+            .join("zips")
+            .join(zip_id)
+            .join("extracted")
+            .join("additional_docx")
+            .join(&docx_id);
+
+        let image_files = extract_images_from_docx(&docx_bytes, &images_dir)
+            .unwrap_or_else(|_| vec![]);
+
+        // 保存 docx 文件本身
+        let docx_dir = batch_dir
+            .join("zips")
+            .join(zip_id)
+            .join("extracted")
+            .join("additional_docx_files");
+        fs::create_dir_all(&docx_dir)?;
+        let docx_path = unique_path(&docx_dir, &name);
+        fs::write(&docx_path, &docx_bytes)?;
+
+        results.push(AdditionalDocx {
+            id: docx_id,
+            name: safe_basename(&name),
+            file_path: docx_path.to_string_lossy().to_string(),
+            fields,
+            full_text,
+            image_files,
+        });
+    }
+
+    Ok(results)
+}
+
+/// 处理嵌套 ZIP 文件
+fn process_nested_zip(
+    batch_dir: &Path,
+    parent_zip_id: &str,
+    parent_zip_path: &Path,
+    nested_zip_indices: &[usize],
+    summary: &mut ZipSummary,
+) -> Result<()> {
+    let f = fs::File::open(parent_zip_path)?;
+    let mut parent_zip = ZipArchive::new(f)?;
+
+    for &index in nested_zip_indices {
+        let mut file = parent_zip.by_index(index)?;
+        let nested_zip_name = decode_zip_filename(file.name_raw());
+        let nested_zip_basename = safe_basename(&nested_zip_name);
+
+        // 读取嵌套 ZIP 内容
+        let mut nested_zip_bytes = Vec::new();
+        file.read_to_end(&mut nested_zip_bytes)?;
+
+        // 解析嵌套 ZIP
+        let cursor = Cursor::new(&nested_zip_bytes);
+        let mut nested_zip = ZipArchive::new(cursor)?;
+
+        // 提取嵌套 ZIP 中的文件
+        for i in 0..nested_zip.len() {
+            let mut nested_file = nested_zip.by_index(i)?;
+            let nested_file_name = decode_zip_filename(nested_file.name_raw());
+            let lower = nested_file_name.to_ascii_lowercase();
+
+            if lower.ends_with("/") || lower.ends_with(".ds_store") {
+                continue;
+            }
+
+            // 为文件名添加前缀（标识来源）
+            let prefixed_name = format!("[{}]/{}", nested_zip_basename, safe_basename(&nested_file_name));
+
+            // 根据文件类型分类处理
+            if lower.ends_with(".docx") {
+                // 处理为附加 docx
+                let mut docx_bytes = Vec::new();
+                nested_file.read_to_end(&mut docx_bytes)?;
+
+                let fields = extract_fields_from_docx(&docx_bytes)
+                    .unwrap_or_else(|_| WordFields::default());
+                let full_text = extract_full_text_from_docx(&docx_bytes)
+                    .unwrap_or_else(|_| String::from("无法提取文本内容"));
+
+                let docx_id = Uuid::new_v4().to_string();
+                let images_dir = batch_dir
+                    .join("zips")
+                    .join(parent_zip_id)
+                    .join("extracted")
+                    .join("nested_zip_docx")
+                    .join(&docx_id);
+
+                let image_files = extract_images_from_docx(&docx_bytes, &images_dir)
+                    .unwrap_or_else(|_| vec![]);
+
+                let docx_dir = batch_dir
+                    .join("zips")
+                    .join(parent_zip_id)
+                    .join("extracted")
+                    .join("nested_zip_docx_files");
+                fs::create_dir_all(&docx_dir)?;
+                let docx_path = unique_path(&docx_dir, &prefixed_name);
+                fs::write(&docx_path, &docx_bytes)?;
+
+                summary.additional_docx_files.push(AdditionalDocx {
+                    id: docx_id,
+                    name: prefixed_name,
+                    file_path: docx_path.to_string_lossy().to_string(),
+                    fields,
+                    full_text,
+                    image_files,
+                });
+            } else if lower.ends_with(".pdf") {
+                // 处理 PDF
+                let pdf_dir = batch_dir
+                    .join("zips")
+                    .join(parent_zip_id)
+                    .join("extracted")
+                    .join("nested_zip_pdfs");
+                fs::create_dir_all(&pdf_dir)?;
+                let pdf_path = unique_path(&pdf_dir, &prefixed_name);
+
+                let mut pdf_bytes = Vec::new();
+                nested_file.read_to_end(&mut pdf_bytes)?;
+                fs::write(&pdf_path, pdf_bytes)?;
+                summary.pdf_files.push(pdf_path.to_string_lossy().to_string());
+            } else if lower.ends_with(".mp4") {
+                // 处理视频
+                let video_dir = batch_dir
+                    .join("zips")
+                    .join(parent_zip_id)
+                    .join("extracted")
+                    .join("nested_zip_videos");
+                fs::create_dir_all(&video_dir)?;
+                let video_path = unique_path(&video_dir, &prefixed_name);
+
+                let mut video_bytes = Vec::new();
+                nested_file.read_to_end(&mut video_bytes)?;
+                fs::write(&video_path, video_bytes)?;
+                summary.video_files.push(video_path.to_string_lossy().to_string());
+            } else if lower.ends_with(".png") || lower.ends_with(".jpg") ||
+                      lower.ends_with(".jpeg") || lower.ends_with(".gif") {
+                // 处理图片
+                let image_dir = batch_dir
+                    .join("zips")
+                    .join(parent_zip_id)
+                    .join("extracted")
+                    .join("nested_zip_images");
+                fs::create_dir_all(&image_dir)?;
+                let image_path = unique_path(&image_dir, &prefixed_name);
+
+                let mut image_bytes = Vec::new();
+                nested_file.read_to_end(&mut image_bytes)?;
+                fs::write(&image_path, image_bytes)?;
+                summary.image_files.push(image_path.to_string_lossy().to_string());
+            } else if lower.ends_with(".xlsx") || lower.ends_with(".xls") {
+                // 处理 Excel
+                let excel_dir = batch_dir
+                    .join("zips")
+                    .join(parent_zip_id)
+                    .join("extracted")
+                    .join("nested_zip_excels");
+                fs::create_dir_all(&excel_dir)?;
+                let excel_path = unique_path(&excel_dir, &prefixed_name);
+
+                let mut excel_bytes = Vec::new();
+                nested_file.read_to_end(&mut excel_bytes)?;
+                fs::write(&excel_path, excel_bytes)?;
+                summary.excel_files.push(excel_path.to_string_lossy().to_string());
+            }
+        }
     }
 
     Ok(())
@@ -2184,7 +2737,9 @@ fn build_summary_docx(batch: &BatchSummary) -> Result<Vec<u8>> {
         for img_path in &z.image_files {
             let bytes = fs::read(img_path)
                 .with_context(|| format!("读取图片失败: {}", img_path))?;
-            let pic = Pic::new(&bytes);
+            // 缩放图片到 600x800，质量 85
+            let resized_bytes = resize_image_to_jpeg(&bytes, 600, 800, 85)?;
+            let pic = Pic::new(&resized_bytes);
             docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_image(pic)));
         }
 
@@ -2194,7 +2749,9 @@ fn build_summary_docx(batch: &BatchSummary) -> Result<Vec<u8>> {
         for img_path in &z.pdf_page_screenshot_files {
             let bytes = fs::read(img_path)
                 .with_context(|| format!("读取PDF页面截图失败: {}", img_path))?;
-            let pic = Pic::new(&bytes);
+            // 缩放图片到 600x800，质量 85
+            let resized_bytes = resize_image_to_jpeg(&bytes, 600, 800, 85)?;
+            let pic = Pic::new(&resized_bytes);
             docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_image(pic)));
         }
 

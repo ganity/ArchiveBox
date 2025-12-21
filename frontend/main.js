@@ -29,6 +29,10 @@ const el = {
   zipList: document.getElementById("zipList"),
   details: document.getElementById("details"),
   status: document.getElementById("status"),
+  progressContainer: document.getElementById("progressContainer"),
+  progressBar: document.getElementById("progressBar"),
+  progressFill: document.getElementById("progressFill"),
+  progressText: document.getElementById("progressText"),
   imageModal: document.getElementById("imageModal"),
   imageModalBackdrop: document.getElementById("imageModalBackdrop"),
   imageModalCloseBtn: document.getElementById("imageModalCloseBtn"),
@@ -53,6 +57,60 @@ let state = {
 
 function setStatus(text) {
   el.status.textContent = text;
+}
+
+// 进度条状态管理
+const progressState = {
+  active: false,
+  operationType: null,
+  current: 0,
+  total: 0,
+  stepName: '',
+  message: ''
+};
+
+function showProgress() {
+  el.progressContainer.classList.remove('hidden');
+  progressState.active = true;
+}
+
+function hideProgress() {
+  el.progressContainer.classList.add('hidden');
+  progressState.active = false;
+  // 重置进度状态
+  progressState.operationType = null;
+  progressState.current = 0;
+  progressState.total = 0;
+  progressState.stepName = '';
+  progressState.message = '';
+  el.progressFill.style.width = '0%';
+}
+
+function updateProgress(progressData) {
+  Object.assign(progressState, progressData);
+
+  if (!progressState.active && progressState.total > 0) {
+    showProgress();
+  }
+
+  // 更新进度条宽度
+  const percentage = progressState.total > 0
+    ? (progressState.current / progressState.total) * 100
+    : 0;
+  el.progressFill.style.width = `${percentage}%`;
+
+  // 更新进度文本
+  const progressText = progressState.message
+    ? `${progressState.stepName}: ${progressState.message}`
+    : progressState.stepName;
+  el.progressText.textContent = progressText;
+
+  // 如果完成，延迟隐藏进度条
+  if (progressData.is_complete) {
+    setTimeout(() => {
+      hideProgress();
+    }, 1000); // 1秒后隐藏
+  }
 }
 
 function openImageModal({ title, path, src }) {
@@ -195,6 +253,10 @@ function initSelectionsForBatch() {
       pdfFiles: (z.pdf_files ?? []).map(() => false),
       pdfScreens: (z.pdf_page_screenshot_files ?? []).map(() => true),
       excels: (z.excel_files ?? []).map(() => true),
+      additionalDocx: (z.additional_docx_files ?? []).map(doc => ({
+        includeText: true,
+        includeImages: (doc.image_files ?? []).map(() => true)
+      })),
     };
     state.imageDataCache[z.id] = {};
   }
@@ -843,6 +905,210 @@ async function renderDetails() {
     }
   }
   el.details.appendChild(excels);
+
+  // 附加 Word 文档区域
+  const additionalDocs = section("附加 Word 文档");
+  const additionalDocxFiles = z.additional_docx_files ?? [];
+  addSelectAllInvert(additionalDocs, {
+    disabled: additionalDocxFiles.length === 0,
+    onAll: () => {
+      for (let i = 0; i < sel.additionalDocx.length; i++) {
+        sel.additionalDocx[i].includeText = true;
+        for (let j = 0; j < sel.additionalDocx[i].includeImages.length; j++) {
+          sel.additionalDocx[i].includeImages[j] = true;
+        }
+      }
+      renderDetails();
+    },
+    onInvert: () => {
+      for (let i = 0; i < sel.additionalDocx.length; i++) {
+        sel.additionalDocx[i].includeText = !sel.additionalDocx[i].includeText;
+        for (let j = 0; j < sel.additionalDocx[i].includeImages.length; j++) {
+          sel.additionalDocx[i].includeImages[j] = !sel.additionalDocx[i].includeImages[j];
+        }
+      }
+      renderDetails();
+    },
+  });
+
+  if (!additionalDocxFiles.length) {
+    const p = document.createElement("div");
+    p.className = "small";
+    p.textContent = "无附加 Word 文档";
+    additionalDocs.appendChild(p);
+  } else {
+    for (let i = 0; i < additionalDocxFiles.length; i++) {
+      const doc = additionalDocxFiles[i];
+      const card = document.createElement("div");
+      card.className = "docx-card";
+      card.style.border = "1px solid #e0e0e0";
+      card.style.borderRadius = "4px";
+      card.style.padding = "12px";
+      card.style.marginBottom = "12px";
+      card.style.backgroundColor = "#fafafa";
+
+      // 标题行：文件名 + 打开按钮
+      const headerRow = document.createElement("div");
+      headerRow.className = "row";
+      headerRow.style.marginBottom = "8px";
+
+      const name = document.createElement("div");
+      name.textContent = doc.name;
+      name.className = "small";
+      name.style.fontWeight = "bold";
+      name.style.flex = "1";
+
+      const openBtn = document.createElement("button");
+      openBtn.textContent = "系统打开";
+      openBtn.onclick = async () => {
+        try {
+          await invoke("open_path", { path: doc.file_path });
+        } catch (e) {
+          setStatus(`打开失败：${e?.message ?? e}`);
+        }
+      };
+
+      headerRow.appendChild(name);
+      headerRow.appendChild(openBtn);
+      card.appendChild(headerRow);
+
+      // 文本内容勾选
+      const textRow = document.createElement("div");
+      textRow.className = "row";
+      textRow.style.marginBottom = "8px";
+
+      const textCb = document.createElement("input");
+      textCb.type = "checkbox";
+      textCb.checked = sel.additionalDocx[i].includeText;
+      textCb.onchange = () => {
+        sel.additionalDocx[i].includeText = textCb.checked;
+      };
+
+      const textLabel = document.createElement("label");
+      textLabel.textContent = "导出文本内容";
+      textLabel.style.marginLeft = "4px";
+      textLabel.style.cursor = "pointer";
+      textLabel.onclick = () => {
+        textCb.checked = !textCb.checked;
+        sel.additionalDocx[i].includeText = textCb.checked;
+      };
+
+      textRow.appendChild(textCb);
+      textRow.appendChild(textLabel);
+      card.appendChild(textRow);
+
+      // 字段展示（如果有）
+      if (doc.fields?.instruction_no || doc.fields?.title || doc.fields?.issued_at) {
+        const fieldsDiv = document.createElement("div");
+        fieldsDiv.className = "kv";
+        fieldsDiv.style.fontSize = "12px";
+        fieldsDiv.style.marginTop = "8px";
+        const fields = [
+          ["指令编号", doc.fields?.instruction_no ?? ""],
+          ["指令标题", doc.fields?.title ?? ""],
+          ["下发时间", doc.fields?.issued_at ?? ""],
+        ];
+
+        for (const [k, v] of fields) {
+          if (v) {
+            const kEl = document.createElement("div");
+            kEl.className = "k";
+            kEl.textContent = k;
+            const vEl = document.createElement("div");
+            vEl.textContent = v;
+            fieldsDiv.appendChild(kEl);
+            fieldsDiv.appendChild(vEl);
+          }
+        }
+        card.appendChild(fieldsDiv);
+      }
+
+      // 完整文本内容预览
+      if (doc.full_text && doc.full_text.trim()) {
+        const textPreviewDiv = document.createElement("div");
+        textPreviewDiv.style.marginTop = "8px";
+        const textLabelDiv = document.createElement("div");
+        textLabelDiv.textContent = "文档内容预览:";
+        textLabelDiv.className = "small";
+        textLabelDiv.style.fontWeight = "bold";
+        textLabelDiv.style.marginBottom = "4px";
+        textPreviewDiv.appendChild(textLabelDiv);
+
+        const textContent = document.createElement("div");
+        textContent.style.fontSize = "12px";
+        textContent.style.color = "#555";
+        textContent.style.backgroundColor = "#f5f5f5";
+        textContent.style.padding = "8px";
+        textContent.style.borderRadius = "4px";
+        textContent.style.maxHeight = "150px";
+        textContent.style.overflowY = "auto";
+        textContent.style.whiteSpace = "pre-wrap";
+        textContent.style.wordBreak = "break-word";
+
+        const previewText = doc.full_text.length > 500
+          ? doc.full_text.substring(0, 500) + "\n\n... (内容较长，导出时将包含完整内容)"
+          : doc.full_text;
+
+        textContent.textContent = previewText;
+        textPreviewDiv.appendChild(textContent);
+        card.appendChild(textPreviewDiv);
+      }
+
+      // 图片展示
+      if (doc.image_files?.length > 0) {
+        const imgsHeader = document.createElement("div");
+        imgsHeader.style.marginTop = "12px";
+        imgsHeader.style.marginBottom = "4px";
+        imgsHeader.style.fontWeight = "bold";
+        imgsHeader.className = "small";
+        imgsHeader.textContent = `文档图片 (${doc.image_files.length}张):`;
+        card.appendChild(imgsHeader);
+
+        const imgsDiv = document.createElement("div");
+        imgsDiv.className = "thumbs";
+
+        for (let j = 0; j < doc.image_files.length; j++) {
+          const imgPath = doc.image_files[j];
+          const imgCard = document.createElement("div");
+          imgCard.className = "thumb";
+
+          const imgRow = document.createElement("div");
+          imgRow.className = "row";
+
+          const imgCb = document.createElement("input");
+          imgCb.type = "checkbox";
+          imgCb.checked = sel.additionalDocx[i].includeImages[j];
+          imgCb.onchange = () => {
+            sel.additionalDocx[i].includeImages[j] = imgCb.checked;
+          };
+
+          const imgName = document.createElement("div");
+          imgName.textContent = basename(imgPath);
+          imgName.className = "small";
+
+          imgRow.appendChild(imgCb);
+          imgRow.appendChild(imgName);
+          imgCard.appendChild(imgRow);
+
+          const imgThumb = document.createElement("img");
+          imgThumb.src = fileSrc(imgPath);
+          imgThumb.style.cursor = "pointer";
+          imgThumb.onclick = () => openImageModal({
+            title: basename(imgPath),
+            path: imgPath,
+            src: fileSrc(imgPath)
+          });
+          imgCard.appendChild(imgThumb);
+
+          imgsDiv.appendChild(imgCard);
+        }
+        card.appendChild(imgsDiv);
+      }
+
+      additionalDocs.appendChild(card);
+    }
+  }
+  el.details.appendChild(additionalDocs);
 }
 
 el.pickZipsBtn.onclick = async () => {
@@ -891,7 +1157,8 @@ el.exportBundleBtn.onclick = async () => {
   try {
     if (!state.batchId) return;
 
-    setStatus("正在导出Word文档（文件嵌入模式）...");
+    // 立即显示准备状态，让用户知道即将弹出文件对话框
+    setStatus("准备导出Word文档，请选择保存位置...");
 
     const selection = {
       zips: state.zips.map((z) => ({
@@ -903,6 +1170,11 @@ el.exportBundleBtn.onclick = async () => {
         selected_pdf_indices: selectedIndices(state.selection[z.id]?.pdfFiles ?? []),
         selected_excel_indices: selectedIndices(state.selection[z.id]?.excels ?? []),
         selected_pdf_page_screenshot_indices: selectedIndices(state.selection[z.id]?.pdfScreens ?? []),
+        selected_additional_docx: (state.selection[z.id]?.additionalDocx ?? []).map((docxSel, idx) => ({
+          docx_index: idx,
+          include_text: docxSel.includeText,
+          selected_image_indices: selectedIndices(docxSel.includeImages ?? []),
+        })).filter(docxSel => docxSel.include_text || docxSel.selected_image_indices.length > 0),
       })),
     };
 
@@ -918,6 +1190,18 @@ el.exportBundleBtn.onclick = async () => {
     setStatus(`导出失败：${e?.message ?? e}`);
   }
 };
+
+// 监听Tauri进度更新事件
+if (window.__TAURI__) {
+  window.__TAURI__.event.listen('progress_update', (event) => {
+    try {
+      const progressData = event.payload;
+      updateProgress(progressData);
+    } catch (error) {
+      console.error('处理进度事件失败:', error);
+    }
+  });
+}
 
 renderList();
 renderDetails();
