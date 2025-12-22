@@ -3,6 +3,7 @@ use calamine::{Reader, Xls, Xlsx};
 use docx_rs::*;
 use encoding_rs::GBK;
 use image::{ImageFormat, GenericImageView};
+use image::codecs::jpeg::JpegEncoder;
 use once_cell::sync::Lazy;
 use quick_xml::events::Event;
 use quick_xml::Reader as XmlReader;
@@ -242,9 +243,9 @@ fn build_enhanced_summary_docx(
                     for img_path in &additional.image_files {
                         let bytes = fs::read(img_path)
                             .with_context(|| format!("读取附加docx图片失败: {}", img_path))?;
-                        // 缩放图片到 800x1000，质量 92（适合A4纸张，文字更清晰）
-                        let resized_bytes = resize_image_to_jpeg(&bytes, 800, 1000, 92)?;
-                        let pic = Pic::new(&resized_bytes);
+                        // 缩放图片到 1200x1680，质量 95（高分辨率，文字非常清晰）
+                        let resized_bytes = resize_image_to_jpeg(&bytes, 1200, 1680, 95)?;
+                        let pic = Pic::new(&resized_bytes).size(5040000, 7056000);
                         docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_image(pic)));
                     }
                 }
@@ -273,9 +274,9 @@ fn build_enhanced_summary_docx(
 
             let processed_images = process_images_parallel_with_progress(
                 &all_images,
-                800,   // 适合A4纸张的宽度
-                1000,  // 适合A4纸张的高度
-                92,    // 提高质量到92，确保文字清晰
+                1200,  // 高分辨率宽度
+                1680,  // 高分辨率高度
+                95,    // 高质量，确保文字非常清晰
                 app,
                 "export_word",
             ).with_context(|| "并行处理图片失败")?;
@@ -293,7 +294,7 @@ fn build_enhanced_summary_docx(
             }
 
             for (_path, resized_bytes) in processed_images {
-                let pic = Pic::new(&resized_bytes);
+                let pic = Pic::new(&resized_bytes).size(5040000, 7056000);
                 docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_image(pic)));
             }
         }
@@ -1908,7 +1909,7 @@ fn decode_zip_filename(name_bytes: &[u8]) -> String {
 /// max_width: 最大宽度（像素）
 /// max_height: 最大高度（像素）
 /// quality: JPEG 质量（1-100）
-fn resize_image_to_jpeg(image_bytes: &[u8], max_width: u32, max_height: u32, _quality: u8) -> Result<Vec<u8>> {
+fn resize_image_to_jpeg(image_bytes: &[u8], max_width: u32, max_height: u32, quality: u8) -> Result<Vec<u8>> {
     // 加载图片
     let img = image::load_from_memory(image_bytes)
         .context("无法加载图片")?;
@@ -1934,12 +1935,17 @@ fn resize_image_to_jpeg(image_bytes: &[u8], max_width: u32, max_height: u32, _qu
         img
     };
 
-    // 转换为 JPEG 格式
+    // 转换为 JPEG 格式，使用指定的质量参数
     let mut jpeg_bytes = Vec::new();
-    let mut cursor = Cursor::new(&mut jpeg_bytes);
-
-    resized.write_to(&mut cursor, ImageFormat::Jpeg)
-        .context("无法将图片转换为JPEG")?;
+    {
+        let mut encoder = JpegEncoder::new_with_quality(&mut jpeg_bytes, quality);
+        encoder.encode(
+            resized.as_bytes(),
+            resized.width(),
+            resized.height(),
+            resized.color().into()
+        ).context("无法将图片转换为JPEG")?;
+    }
 
     Ok(jpeg_bytes)
 }
@@ -2909,9 +2915,9 @@ fn build_summary_docx(batch: &BatchSummary) -> Result<Vec<u8>> {
         for img_path in &z.image_files {
             let bytes = fs::read(img_path)
                 .with_context(|| format!("读取图片失败: {}", img_path))?;
-            // 缩放图片到 800x1000，质量 92（适合A4纸张，文字更清晰）
-            let resized_bytes = resize_image_to_jpeg(&bytes, 800, 1000, 92)?;
-            let pic = Pic::new(&resized_bytes);
+            // 缩放图片到 1200x1680，质量 95（高分辨率，文字非常清晰）
+            let resized_bytes = resize_image_to_jpeg(&bytes, 1200, 1680, 95)?;
+            let pic = Pic::new(&resized_bytes).size(5040000, 7056000);
             docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_image(pic)));
         }
 
@@ -2921,9 +2927,9 @@ fn build_summary_docx(batch: &BatchSummary) -> Result<Vec<u8>> {
         for img_path in &z.pdf_page_screenshot_files {
             let bytes = fs::read(img_path)
                 .with_context(|| format!("读取PDF页面截图失败: {}", img_path))?;
-            // 缩放图片到 800x1000，质量 92（适合A4纸张，文字更清晰）
-            let resized_bytes = resize_image_to_jpeg(&bytes, 800, 1000, 92)?;
-            let pic = Pic::new(&resized_bytes);
+            // 缩放图片到 1200x1680，质量 95（高分辨率，文字非常清晰）
+            let resized_bytes = resize_image_to_jpeg(&bytes, 1200, 1680, 95)?;
+            let pic = Pic::new(&resized_bytes).size(5040000, 7056000);
             docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_image(pic)));
         }
 
