@@ -187,12 +187,12 @@ async function renderPdfToPngDataUrls(pdfPath, { maxPages = 50 } = {}) {
     while (retryCount < maxRetries) {
       try {
         const ab = await fetch(url).then((r) => {
-          if (!r.ok) throw new Error(`读取PDF失败：${r.status} ${r.statusText}`);
+          if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText}`);
           return r.arrayBuffer();
         });
         
         if (ab.byteLength === 0) {
-          throw new Error("PDF文件为空或无法读取");
+          throw new Error("PDF文件为空 (0字节)");
         }
         
         // 简单的PDF文件头验证
@@ -207,7 +207,7 @@ async function renderPdfToPngDataUrls(pdfPath, { maxPages = 50 } = {}) {
         }
         
         if (!isValidPdf) {
-          throw new Error("文件不是有效的PDF格式");
+          throw new Error("文件不是有效的PDF格式 (缺少PDF文件头)");
         }
         
         loadingTask = pdfjsLib.getDocument({ 
@@ -224,15 +224,20 @@ async function renderPdfToPngDataUrls(pdfPath, { maxPages = 50 } = {}) {
         doc = await loadingTask.promise;
         
         // 验证文档是否有效
-        if (!doc || doc.numPages === 0) {
-          throw new Error("PDF文档无效或没有页面");
+        if (!doc) {
+          throw new Error("PDF文档加载失败 (文档对象为空)");
+        }
+        
+        if (doc.numPages === 0) {
+          throw new Error("PDF文档没有页面 (页数为0)");
         }
         
         break; // 成功加载，跳出重试循环
         
       } catch (error) {
         retryCount++;
-        console.warn(`PDF加载失败 (尝试 ${retryCount}/${maxRetries}):`, error.message);
+        const errorMsg = error?.message || error?.toString() || "未知错误";
+        console.warn(`PDF加载失败 (尝试 ${retryCount}/${maxRetries}): ${errorMsg}`);
         
         // 清理失败的资源
         if (loadingTask) {
@@ -245,7 +250,21 @@ async function renderPdfToPngDataUrls(pdfPath, { maxPages = 50 } = {}) {
         }
         
         if (retryCount >= maxRetries) {
-          throw new Error(`PDF加载失败，已重试${maxRetries}次: ${error.message}`);
+          // 提供更详细的错误信息
+          let detailedError = `PDF加载失败 (已重试${maxRetries}次): ${errorMsg}`;
+          
+          // 根据错误类型提供更具体的说明
+          if (errorMsg.includes("HTTP 404")) {
+            detailedError += " - 文件不存在或路径错误";
+          } else if (errorMsg.includes("HTTP 403")) {
+            detailedError += " - 文件访问被拒绝";
+          } else if (errorMsg.includes("为空")) {
+            detailedError += " - 可能文件损坏或正在被其他程序使用";
+          } else if (errorMsg.includes("PDF格式")) {
+            detailedError += " - 文件可能不是PDF或已损坏";
+          }
+          
+          throw new Error(detailedError);
         }
         
         // 等待一段时间后重试
@@ -254,11 +273,12 @@ async function renderPdfToPngDataUrls(pdfPath, { maxPages = 50 } = {}) {
     }
 
     if (!doc) {
-      throw new Error("无法加载PDF文档");
+      throw new Error("无法加载PDF文档 (重试后仍然失败)");
     }
 
     const numPages = Math.min(doc.numPages, maxPages);
     const out = [];
+    let failedPages = 0;
 
     // 逐页处理，避免内存爆炸
     for (let p = 1; p <= numPages; p++) {
@@ -272,6 +292,7 @@ async function renderPdfToPngDataUrls(pdfPath, { maxPages = 50 } = {}) {
         // 验证页面是否有效
         if (!page) {
           console.warn(`PDF第${p}页无效，跳过`);
+          failedPages++;
           continue;
         }
         
@@ -280,6 +301,7 @@ async function renderPdfToPngDataUrls(pdfPath, { maxPages = 50 } = {}) {
         // 检查页面尺寸是否合理
         if (viewport1.width <= 0 || viewport1.height <= 0) {
           console.warn(`PDF第${p}页尺寸无效 (${viewport1.width}x${viewport1.height})，跳过`);
+          failedPages++;
           continue;
         }
         
@@ -295,7 +317,7 @@ async function renderPdfToPngDataUrls(pdfPath, { maxPages = 50 } = {}) {
         // 添加渲染超时
         const renderPromise = page.render({ canvasContext: ctx, viewport }).promise;
         const timeoutPromise = new Promise((_, reject) => {
-          setTimeout(() => reject(new Error("渲染超时")), 30000); // 30秒超时
+          setTimeout(() => reject(new Error("渲染超时 (30秒)")), 30000);
         });
         
         await Promise.race([renderPromise, timeoutPromise]);
@@ -305,10 +327,13 @@ async function renderPdfToPngDataUrls(pdfPath, { maxPages = 50 } = {}) {
           out.push(dataUrl);
         } else {
           console.warn(`PDF第${p}页生成的截图无效`);
+          failedPages++;
         }
         
       } catch (pageError) {
-        console.warn(`渲染PDF第${p}页失败:`, pageError.message);
+        failedPages++;
+        const pageErrorMsg = pageError?.message || pageError?.toString() || "未知错误";
+        console.warn(`渲染PDF第${p}页失败: ${pageErrorMsg}`);
         // 继续处理下一页，不中断整个流程
       } finally {
         // 立即清理页面资源
@@ -336,7 +361,16 @@ async function renderPdfToPngDataUrls(pdfPath, { maxPages = 50 } = {}) {
     }
     
     if (out.length === 0) {
-      throw new Error("没有成功生成任何页面截图");
+      let errorMsg = "没有成功生成任何页面截图";
+      if (failedPages > 0) {
+        errorMsg += ` (共${numPages}页，失败${failedPages}页)`;
+      }
+      throw new Error(errorMsg);
+    }
+    
+    // 如果有部分页面失败，记录警告
+    if (failedPages > 0) {
+      console.warn(`PDF处理完成，但有${failedPages}页失败 (成功${out.length}页)`);
     }
     
     return out;
@@ -374,6 +408,7 @@ async function autoGeneratePdfScreenshots() {
   let totalPdfs = 0;
   let processedPdfs = 0;
   let failedPdfs = 0;
+  let failedFiles = []; // 记录失败的文件信息
   
   try {
     // 统计总PDF数量
@@ -402,7 +437,13 @@ async function autoGeneratePdfScreenshots() {
       for (const pdfPath of z.pdf_files) {
         try {
           processedPdfs++;
-          setStatus(`正在生成PDF页面截图 (${processedPdfs}/${totalPdfs})：${z.filename} / ${basename(pdfPath)}`);
+          
+          // 构建显示用的相对路径：ZIP文件名/PDF文件名
+          const zipFileName = z.filename || basename(z.source_path || z.stored_path || "未知ZIP");
+          const pdfFileName = basename(pdfPath);
+          const displayPath = `${zipFileName}/${pdfFileName}`;
+          
+          setStatus(`正在生成PDF页面截图 (${processedPdfs}/${totalPdfs})：${displayPath}`);
           
           // 添加延迟，避免过快的连续处理导致资源冲突
           if (processedPdfs > 1) {
@@ -414,6 +455,13 @@ async function autoGeneratePdfScreenshots() {
           if (dataUrls.length === 0) {
             console.warn(`PDF文件没有生成任何截图: ${pdfPath}`);
             failedPdfs++;
+            failedFiles.push({
+              zipName: zipFileName,
+              pdfName: pdfFileName,
+              fullPath: pdfPath,
+              displayPath: displayPath,
+              reason: "没有生成任何截图"
+            });
             continue;
           }
           
@@ -439,8 +487,23 @@ async function autoGeneratePdfScreenshots() {
           
         } catch (e) {
           failedPdfs++;
-          console.error(`PDF截图生成失败: ${pdfPath}`, e);
-          setStatus(`PDF截图生成失败 (${processedPdfs}/${totalPdfs})：${basename(pdfPath)} - ${e?.message ?? e}`);
+          
+          // 构建显示用的相对路径
+          const zipFileName = z.filename || basename(z.source_path || z.stored_path || "未知ZIP");
+          const pdfFileName = basename(pdfPath);
+          const displayPath = `${zipFileName}/${pdfFileName}`;
+          
+          // 记录失败的文件详细信息
+          failedFiles.push({
+            zipName: zipFileName,
+            pdfName: pdfFileName,
+            fullPath: pdfPath,
+            displayPath: displayPath,
+            reason: e?.message || e?.toString() || "未知错误"
+          });
+          
+          console.error(`PDF截图生成失败: ${displayPath}`, e);
+          setStatus(`PDF截图生成失败 (${processedPdfs}/${totalPdfs})：${displayPath} - ${e?.message ?? e}`);
           
           // 等待一段时间后继续处理下一个文件
           await new Promise(resolve => setTimeout(resolve, 1000));
@@ -449,10 +512,50 @@ async function autoGeneratePdfScreenshots() {
     }
     
     const successCount = processedPdfs - failedPdfs;
+    
+    // 构建结果消息
+    let resultMessage = "";
     if (failedPdfs > 0) {
-      setStatus(`PDF页面截图生成完成：成功 ${successCount} 个，失败 ${failedPdfs} 个`);
+      resultMessage = `PDF页面截图生成完成：成功 ${successCount} 个，失败 ${failedPdfs} 个`;
+      
+      // 显示失败文件的详细信息
+      if (failedFiles.length > 0) {
+        console.group("PDF截图生成失败的文件详情:");
+        failedFiles.forEach((file, index) => {
+          console.error(`${index + 1}. ${file.displayPath}`);
+          console.error(`   原因: ${file.reason}`);
+          console.error(`   完整路径: ${file.fullPath}`);
+        });
+        console.groupEnd();
+        
+        // 构建详细的失败文件列表，直接显示在状态栏
+        const failedDetails = failedFiles.map((file, index) => 
+          `${index + 1}. ${file.displayPath} (${file.reason})`
+        ).join('\n');
+        
+        // 如果失败文件较少，显示所有失败文件的详细信息
+        if (failedFiles.length <= 5) {
+          resultMessage += `\n\n失败文件详情:\n${failedDetails}`;
+        } else {
+          // 如果失败文件很多，显示前3个和总数
+          const firstThree = failedFiles.slice(0, 3).map((file, index) => 
+            `${index + 1}. ${file.displayPath} (${file.reason})`
+          ).join('\n');
+          resultMessage += `\n\n失败文件详情 (前3个):\n${firstThree}\n... 还有 ${failedFiles.length - 3} 个失败文件`;
+          
+          // 同时在控制台显示完整列表
+          console.warn("完整的失败文件列表:", failedFiles);
+        }
+      }
     } else {
-      setStatus(`PDF页面截图自动生成完成：共处理 ${successCount} 个文件`);
+      resultMessage = `PDF页面截图自动生成完成：共处理 ${successCount} 个文件`;
+    }
+    
+    setStatus(resultMessage);
+    
+    // 如果有失败文件，创建一个详细的弹窗显示
+    if (failedFiles.length > 0) {
+      showPdfFailureDetails(failedFiles, successCount, failedPdfs);
     }
     
   } catch (e) {
@@ -466,6 +569,120 @@ async function autoGeneratePdfScreenshots() {
       window.gc();
     }
   }
+}
+
+// 显示PDF处理失败文件的详细信息
+function showPdfFailureDetails(failedFiles, successCount, failedCount) {
+  // 创建详情内容
+  const detailsHtml = `
+    <div style="max-height: 400px; overflow-y: auto; font-family: monospace; font-size: 12px; line-height: 1.4;">
+      <h3 style="margin: 0 0 10px 0; color: #dc2626;">PDF截图生成结果</h3>
+      <p style="margin: 0 0 15px 0;">
+        <span style="color: #059669;">✓ 成功: ${successCount} 个</span> | 
+        <span style="color: #dc2626;">✗ 失败: ${failedCount} 个</span>
+      </p>
+      
+      <h4 style="margin: 0 0 10px 0; color: #dc2626;">失败文件详情:</h4>
+      <div style="background: #f9fafb; padding: 10px; border-radius: 4px; border-left: 3px solid #dc2626;">
+        ${failedFiles.map((file, index) => `
+          <div style="margin-bottom: 12px; padding-bottom: 8px; ${index < failedFiles.length - 1 ? 'border-bottom: 1px solid #e5e7eb;' : ''}">
+            <div style="font-weight: bold; color: #1f2937; margin-bottom: 2px;">
+              ${index + 1}. ${file.displayPath}
+            </div>
+            <div style="color: #dc2626; margin-bottom: 2px;">
+              原因: ${file.reason}
+            </div>
+            <div style="color: #6b7280; font-size: 11px;">
+              完整路径: ${file.fullPath}
+            </div>
+          </div>
+        `).join('')}
+      </div>
+      
+      <div style="margin-top: 15px; padding: 8px; background: #fef3c7; border-radius: 4px; font-size: 11px; color: #92400e;">
+        <strong>提示:</strong> 失败的PDF文件可能是由于文件损坏、格式错误或正在被其他程序使用。请检查这些文件并重新尝试。
+      </div>
+    </div>
+  `;
+
+  // 显示确认对话框，但用HTML内容
+  const userConfirmed = confirm(`PDF页面截图生成完成！\n\n成功: ${successCount} 个\n失败: ${failedCount} 个\n\n点击"确定"查看失败文件详情，点击"取消"关闭。`);
+  
+  if (userConfirmed) {
+    // 创建一个临时的详情显示窗口
+    showPdfFailureModal(detailsHtml);
+  }
+}
+
+// 创建并显示PDF失败详情的模态窗口
+function showPdfFailureModal(htmlContent) {
+  // 移除已存在的模态窗口
+  const existingModal = document.getElementById('pdfFailureModal');
+  if (existingModal) {
+    existingModal.remove();
+  }
+
+  // 创建模态窗口
+  const modal = document.createElement('div');
+  modal.id = 'pdfFailureModal';
+  modal.style.cssText = `
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 10000;
+  `;
+
+  const modalContent = document.createElement('div');
+  modalContent.style.cssText = `
+    background: white;
+    padding: 20px;
+    border-radius: 8px;
+    max-width: 80%;
+    max-height: 80%;
+    overflow: hidden;
+    box-shadow: 0 10px 25px rgba(0, 0, 0, 0.2);
+  `;
+
+  const closeButton = document.createElement('button');
+  closeButton.textContent = '关闭';
+  closeButton.style.cssText = `
+    float: right;
+    margin-bottom: 10px;
+    padding: 6px 12px;
+    background: #dc2626;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+  `;
+  closeButton.onclick = () => modal.remove();
+
+  modalContent.innerHTML = htmlContent;
+  modalContent.insertBefore(closeButton, modalContent.firstChild);
+  modal.appendChild(modalContent);
+  document.body.appendChild(modal);
+
+  // 点击背景关闭
+  modal.onclick = (e) => {
+    if (e.target === modal) {
+      modal.remove();
+    }
+  };
+
+  // ESC键关闭
+  const handleEsc = (e) => {
+    if (e.key === 'Escape') {
+      modal.remove();
+      document.removeEventListener('keydown', handleEsc);
+    }
+  };
+  document.addEventListener('keydown', handleEsc);
 }
 
 function initSelectionsForBatch() {
