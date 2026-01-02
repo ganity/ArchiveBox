@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use calamine::{Reader, Xls, Xlsx};
 use docx_rs::*;
 use encoding_rs::GBK;
-use image::{ImageFormat, GenericImageView};
+use image::GenericImageView;
 use image::codecs::jpeg::JpegEncoder;
 use once_cell::sync::Lazy;
 use quick_xml::events::Event;
@@ -1272,6 +1272,11 @@ fn import_zips(app: tauri::AppHandle, state: State<'_, AppState>, paths: Vec<Str
     let start_event = ProgressEvent::new("import", 0, total_zips, "开始导入", "正在准备导入ZIP文件");
     if let Err(e) = emit_progress_handle(&app, start_event) {
         eprintln!("发送进度事件失败: {}", e);
+    }
+
+    // 清理旧的批次文件（保留最近的3个批次）
+    if let Err(e) = cleanup_old_batches_internal(&app, 3) {
+        eprintln!("清理旧批次失败: {}", e);
     }
 
     let now = OffsetDateTime::now_utc();
@@ -3122,6 +3127,10 @@ fn save_pdf_page_screenshots(
     pdf_name: String,
     screenshots: Vec<String>,
 ) -> Result<Vec<String>, String> {
+    if screenshots.is_empty() {
+        return Err("没有提供截图数据".to_string());
+    }
+    
     let batch_dir = batch_dir(&app, &batch_id).map_err(err_to_string)?;
     let mut batch: BatchSummary = read_batch(&batch_dir).map_err(err_to_string)?;
 
@@ -3137,22 +3146,55 @@ fn save_pdf_page_screenshots(
         .join("extracted")
         .join("pdf_screens")
         .join(sanitize_file_stem(&pdf_name));
-    fs::create_dir_all(&out_dir).map_err(err_to_string)?;
+    
+    // 确保目录存在
+    fs::create_dir_all(&out_dir).map_err(|e| format!("创建目录失败: {}", e))?;
 
     let mut saved = Vec::new();
+    let mut failed_count = 0;
+    
     for (i, s) in screenshots.iter().enumerate() {
-        let bytes = decode_data_url_base64(s).map_err(err_to_string)?;
-        let out_path = out_dir.join(format!("page_{:03}.png", i + 1));
-        fs::write(&out_path, bytes).map_err(err_to_string)?;
-        let p = out_path.to_string_lossy().to_string();
-        saved.push(p.clone());
-        zip.pdf_page_screenshot_files.push(p);
+        match decode_data_url_base64(s) {
+            Ok(bytes) => {
+                if bytes.is_empty() {
+                    eprintln!("警告: 第{}页截图数据为空", i + 1);
+                    failed_count += 1;
+                    continue;
+                }
+                
+                let out_path = out_dir.join(format!("page_{:03}.png", i + 1));
+                match fs::write(&out_path, bytes) {
+                    Ok(_) => {
+                        let p = out_path.to_string_lossy().to_string();
+                        saved.push(p.clone());
+                        zip.pdf_page_screenshot_files.push(p);
+                    }
+                    Err(e) => {
+                        eprintln!("警告: 保存第{}页截图失败: {}", i + 1, e);
+                        failed_count += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("警告: 解码第{}页截图数据失败: {}", i + 1, e);
+                failed_count += 1;
+            }
+        }
     }
-
+    
+    if saved.is_empty() {
+        return Err(format!("所有截图保存失败，共{}个截图", screenshots.len()));
+    }
+    
+    // 保存批次信息
     let meta_path = batch_dir.join("batch.json");
     fs::write(&meta_path, serde_json::to_vec_pretty(&batch).map_err(err_to_string)?)
-        .map_err(err_to_string)?;
+        .map_err(|e| format!("保存批次信息失败: {}", e))?;
 
+    if failed_count > 0 {
+        println!("PDF截图保存完成: 成功{}个，失败{}个", saved.len(), failed_count);
+    }
+    
     Ok(saved)
 }
 
@@ -3485,7 +3527,9 @@ pub fn run() {
             open_path,
             get_preview_image_data,
             get_excel_preview_data,
-            save_pdf_page_screenshots
+            save_pdf_page_screenshots,
+            cleanup_temp_files,
+            cleanup_old_batches
         ])
         .setup(|app| {
             if cfg!(debug_assertions) {
@@ -3497,9 +3541,150 @@ pub fn run() {
             }
             Ok(())
         })
+        .on_window_event(|window, event| {
+            match event {
+                tauri::WindowEvent::CloseRequested { .. } => {
+                    // 应用关闭时清理临时文件
+                    if let Err(e) = cleanup_temp_files_on_exit(window.app_handle()) {
+                        eprintln!("清理临时文件失败: {}", e);
+                    }
+                }
+                _ => {}
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+// ==================== 临时文件清理功能 ====================
+
+/// 应用关闭时清理临时文件
+fn cleanup_temp_files_on_exit(app: &tauri::AppHandle) -> Result<()> {
+    println!("应用关闭，开始清理临时文件...");
+    
+    // 清理所有批次文件
+    if let Ok(app_data) = app_data_dir(app) {
+        let batches_dir = app_data.join("batches");
+        if batches_dir.exists() {
+            match fs::remove_dir_all(&batches_dir) {
+                Ok(_) => println!("✓ 已清理所有批次文件: {}", batches_dir.display()),
+                Err(e) => eprintln!("⚠ 清理批次文件失败: {}", e),
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+/// 手动清理临时文件的命令
+#[tauri::command]
+fn cleanup_temp_files(app: tauri::AppHandle) -> Result<String, String> {
+    let app_data = app_data_dir(&app).map_err(err_to_string)?;
+    let batches_dir = app_data.join("batches");
+    
+    if !batches_dir.exists() {
+        return Ok("没有找到需要清理的临时文件".to_string());
+    }
+    
+    // 计算清理前的大小
+    let size_before = calculate_dir_size(&batches_dir).unwrap_or(0);
+    let size_mb = size_before as f64 / 1024.0 / 1024.0;
+    
+    // 清理所有批次文件
+    fs::remove_dir_all(&batches_dir).map_err(err_to_string)?;
+    
+    Ok(format!("已清理临时文件，释放空间: {:.1} MB", size_mb))
+}
+
+/// 清理旧的批次文件，保留最近的几个
+#[tauri::command]
+fn cleanup_old_batches(app: tauri::AppHandle, keep_count: Option<usize>) -> Result<String, String> {
+    let keep = keep_count.unwrap_or(3);
+    cleanup_old_batches_internal(&app, keep).map_err(err_to_string)?;
+    Ok(format!("已清理旧批次，保留最近 {} 个批次", keep))
+}
+
+/// 内部清理旧批次的实现
+fn cleanup_old_batches_internal(app: &tauri::AppHandle, keep_count: usize) -> Result<()> {
+    let app_data = app_data_dir(app)?;
+    let batches_dir = app_data.join("batches");
+    
+    if !batches_dir.exists() {
+        return Ok(());
+    }
+    
+    // 获取所有批次目录
+    let mut batch_dirs = Vec::new();
+    for entry in fs::read_dir(&batches_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with("batch_") {
+                    // 提取时间戳进行排序
+                    if let Some(timestamp_str) = name.strip_prefix("batch_") {
+                        if let Ok(timestamp) = timestamp_str.parse::<i64>() {
+                            batch_dirs.push((timestamp, path));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // 按时间戳排序（最新的在前）
+    batch_dirs.sort_by(|a, b| b.0.cmp(&a.0));
+    
+    // 删除超出保留数量的旧批次
+    if batch_dirs.len() > keep_count {
+        let to_remove = &batch_dirs[keep_count..];
+        let mut total_size = 0u64;
+        
+        for (_timestamp, path) in to_remove {
+            let size = calculate_dir_size(path).unwrap_or(0);
+            total_size += size;
+            
+            match fs::remove_dir_all(path) {
+                Ok(_) => {
+                    println!("✓ 已删除旧批次: {} (大小: {:.1} MB)", 
+                            path.display(), 
+                            size as f64 / 1024.0 / 1024.0);
+                }
+                Err(e) => {
+                    eprintln!("⚠ 删除旧批次失败: {} - {}", path.display(), e);
+                }
+            }
+        }
+        
+        if total_size > 0 {
+            println!("✓ 清理完成，释放空间: {:.1} MB", total_size as f64 / 1024.0 / 1024.0);
+        }
+    }
+    
+    Ok(())
+}
+
+/// 计算目录大小
+fn calculate_dir_size(dir: &Path) -> Result<u64> {
+    let mut total_size = 0u64;
+    
+    if dir.is_dir() {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            
+            if path.is_dir() {
+                total_size += calculate_dir_size(&path)?;
+            } else {
+                total_size += entry.metadata()?.len();
+            }
+        }
+    }
+    
+    Ok(total_size)
+}
+
+// ==================== 临时文件清理功能结束 ====================
 
 #[cfg(test)]
 mod tests {

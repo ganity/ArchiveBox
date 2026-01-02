@@ -26,6 +26,7 @@ const el = {
   pickZipsBtn: document.getElementById("pickZipsBtn"),
   exportExcelBtn: document.getElementById("exportExcelBtn"),
   exportBundleBtn: document.getElementById("exportBundleBtn"),
+  cleanupBtn: document.getElementById("cleanupBtn"),
   zipList: document.getElementById("zipList"),
   details: document.getElementById("details"),
   status: document.getElementById("status"),
@@ -174,32 +175,190 @@ function ensurePdfJs() {
 async function renderPdfToPngDataUrls(pdfPath, { maxPages = 50 } = {}) {
   const pdfjsLib = ensurePdfJs();
   const url = fileSrc(pdfPath);
-  const ab = await fetch(url).then((r) => {
-    if (!r.ok) throw new Error(`读取PDF失败：${r.status}`);
-    return r.arrayBuffer();
-  });
-  const loadingTask = pdfjsLib.getDocument({ data: ab });
-  const doc = await loadingTask.promise;
-  const numPages = Math.min(doc.numPages, maxPages);
+  
+  let doc = null;
+  let loadingTask = null;
+  
+  try {
+    // 添加重试机制和更好的错误处理
+    let retryCount = 0;
+    const maxRetries = 3;
+    
+    while (retryCount < maxRetries) {
+      try {
+        const ab = await fetch(url).then((r) => {
+          if (!r.ok) throw new Error(`读取PDF失败：${r.status} ${r.statusText}`);
+          return r.arrayBuffer();
+        });
+        
+        if (ab.byteLength === 0) {
+          throw new Error("PDF文件为空或无法读取");
+        }
+        
+        // 简单的PDF文件头验证
+        const header = new Uint8Array(ab.slice(0, 8));
+        const pdfSignature = [0x25, 0x50, 0x44, 0x46]; // %PDF
+        let isValidPdf = true;
+        for (let i = 0; i < 4; i++) {
+          if (header[i] !== pdfSignature[i]) {
+            isValidPdf = false;
+            break;
+          }
+        }
+        
+        if (!isValidPdf) {
+          throw new Error("文件不是有效的PDF格式");
+        }
+        
+        loadingTask = pdfjsLib.getDocument({ 
+          data: ab,
+          // 添加PDF.js配置以提高稳定性
+          verbosity: 0, // 减少日志输出
+          maxImageSize: 16777216, // 16MB 限制图片大小
+          disableFontFace: true, // 禁用字体加载以提高性能
+          disableRange: true, // 禁用范围请求
+          disableStream: true, // 禁用流式加载
+          stopAtErrors: false, // 遇到错误时不停止，尝试继续处理
+        });
+        
+        doc = await loadingTask.promise;
+        
+        // 验证文档是否有效
+        if (!doc || doc.numPages === 0) {
+          throw new Error("PDF文档无效或没有页面");
+        }
+        
+        break; // 成功加载，跳出重试循环
+        
+      } catch (error) {
+        retryCount++;
+        console.warn(`PDF加载失败 (尝试 ${retryCount}/${maxRetries}):`, error.message);
+        
+        // 清理失败的资源
+        if (loadingTask) {
+          try {
+            await loadingTask.destroy();
+          } catch (e) {
+            console.warn("清理loadingTask失败:", e);
+          }
+          loadingTask = null;
+        }
+        
+        if (retryCount >= maxRetries) {
+          throw new Error(`PDF加载失败，已重试${maxRetries}次: ${error.message}`);
+        }
+        
+        // 等待一段时间后重试
+        await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
+      }
+    }
 
-  const out = [];
-  for (let p = 1; p <= numPages; p++) {
-    const page = await doc.getPage(p);
-    const viewport1 = page.getViewport({ scale: 1 });
-    const maxDim = 1200;
-    const scale = Math.min(2.0, Math.max(1.0, maxDim / Math.max(viewport1.width, viewport1.height)));
-    const viewport = page.getViewport({ scale });
+    if (!doc) {
+      throw new Error("无法加载PDF文档");
+    }
 
-    const canvas = document.createElement("canvas");
-    const ctx = canvas.getContext("2d");
-    canvas.width = Math.floor(viewport.width);
-    canvas.height = Math.floor(viewport.height);
-    await page.render({ canvasContext: ctx, viewport }).promise;
-    out.push(canvas.toDataURL("image/png"));
-    page.cleanup();
+    const numPages = Math.min(doc.numPages, maxPages);
+    const out = [];
+
+    // 逐页处理，避免内存爆炸
+    for (let p = 1; p <= numPages; p++) {
+      let page = null;
+      let canvas = null;
+      let ctx = null;
+      
+      try {
+        page = await doc.getPage(p);
+        
+        // 验证页面是否有效
+        if (!page) {
+          console.warn(`PDF第${p}页无效，跳过`);
+          continue;
+        }
+        
+        const viewport1 = page.getViewport({ scale: 1 });
+        
+        // 检查页面尺寸是否合理
+        if (viewport1.width <= 0 || viewport1.height <= 0) {
+          console.warn(`PDF第${p}页尺寸无效 (${viewport1.width}x${viewport1.height})，跳过`);
+          continue;
+        }
+        
+        const maxDim = 1200;
+        const scale = Math.min(2.0, Math.max(1.0, maxDim / Math.max(viewport1.width, viewport1.height)));
+        const viewport = page.getViewport({ scale });
+
+        canvas = document.createElement("canvas");
+        ctx = canvas.getContext("2d");
+        canvas.width = Math.floor(viewport.width);
+        canvas.height = Math.floor(viewport.height);
+        
+        // 添加渲染超时
+        const renderPromise = page.render({ canvasContext: ctx, viewport }).promise;
+        const timeoutPromise = new Promise((_, reject) => {
+          setTimeout(() => reject(new Error("渲染超时")), 30000); // 30秒超时
+        });
+        
+        await Promise.race([renderPromise, timeoutPromise]);
+        
+        const dataUrl = canvas.toDataURL("image/png");
+        if (dataUrl && dataUrl.length > 100) { // 确保生成了有效的图片
+          out.push(dataUrl);
+        } else {
+          console.warn(`PDF第${p}页生成的截图无效`);
+        }
+        
+      } catch (pageError) {
+        console.warn(`渲染PDF第${p}页失败:`, pageError.message);
+        // 继续处理下一页，不中断整个流程
+      } finally {
+        // 立即清理页面资源
+        if (page) {
+          try {
+            page.cleanup();
+          } catch (e) {
+            console.warn(`清理PDF第${p}页失败:`, e);
+          }
+        }
+        
+        // 清理canvas资源
+        if (canvas) {
+          canvas.width = 0;
+          canvas.height = 0;
+          canvas = null;
+        }
+        ctx = null;
+      }
+      
+      // 每处理几页后强制垃圾回收（如果可用）
+      if (p % 5 === 0 && window.gc) {
+        window.gc();
+      }
+    }
+    
+    if (out.length === 0) {
+      throw new Error("没有成功生成任何页面截图");
+    }
+    
+    return out;
+    
+  } finally {
+    // 确保资源被正确清理
+    if (doc) {
+      try {
+        await doc.cleanup();
+      } catch (e) {
+        console.warn("清理PDF文档失败:", e);
+      }
+    }
+    
+    if (loadingTask) {
+      try {
+        await loadingTask.destroy();
+      } catch (e) {
+        console.warn("销毁loadingTask失败:", e);
+      }
+    }
   }
-  await doc.cleanup();
-  return out;
 }
 
 async function autoGeneratePdfScreenshots() {
@@ -211,36 +370,101 @@ async function autoGeneratePdfScreenshots() {
   }
   if (state.pdfRendering.busy) return;
   state.pdfRendering.busy = true;
+  
+  let totalPdfs = 0;
+  let processedPdfs = 0;
+  let failedPdfs = 0;
+  
   try {
+    // 统计总PDF数量
+    for (const z of state.zips) {
+      if (z.status?.startsWith?.("failed")) continue;
+      if (!z.pdf_files?.length) continue;
+      if ((z.pdf_page_screenshot_files?.length ?? 0) > 0) continue;
+      totalPdfs += z.pdf_files.length;
+    }
+    
+    if (totalPdfs === 0) {
+      setStatus("没有需要生成截图的PDF文件");
+      return;
+    }
+    
+    setStatus(`开始生成PDF页面截图，共 ${totalPdfs} 个文件...`);
+    
+    // 逐个ZIP处理，避免并发冲突
     for (const z of state.zips) {
       if (z.status?.startsWith?.("failed")) continue;
       if (!z.pdf_files?.length) continue;
       // 如果已有截图，先不重复生成（避免重复与耗时）
       if ((z.pdf_page_screenshot_files?.length ?? 0) > 0) continue;
 
+      // 逐个PDF处理，避免资源竞争
       for (const pdfPath of z.pdf_files) {
-        setStatus(`正在自动生成PDF页面截图：${z.filename} / ${basename(pdfPath)} …`);
-        const dataUrls = await renderPdfToPngDataUrls(pdfPath, { maxPages: 20 });
-        const saved = await invoke("save_pdf_page_screenshots", {
-          batchId: state.batchId,
-          zipId: z.id,
-          pdfName: basename(pdfPath),
-          screenshots: dataUrls,
-        });
-        z.pdf_page_screenshot_files = [...(z.pdf_page_screenshot_files ?? []), ...saved];
-        const sel = state.selection[z.id];
-        sel.pdfScreens = [...(sel.pdfScreens ?? []), ...saved.map(() => true)];
-        if (state.selectedZipId === z.id) {
-          await renderDetails();
+        try {
+          processedPdfs++;
+          setStatus(`正在生成PDF页面截图 (${processedPdfs}/${totalPdfs})：${z.filename} / ${basename(pdfPath)}`);
+          
+          // 添加延迟，避免过快的连续处理导致资源冲突
+          if (processedPdfs > 1) {
+            await new Promise(resolve => setTimeout(resolve, 500));
+          }
+          
+          const dataUrls = await renderPdfToPngDataUrls(pdfPath, { maxPages: 20 });
+          
+          if (dataUrls.length === 0) {
+            console.warn(`PDF文件没有生成任何截图: ${pdfPath}`);
+            failedPdfs++;
+            continue;
+          }
+          
+          const saved = await invoke("save_pdf_page_screenshots", {
+            batchId: state.batchId,
+            zipId: z.id,
+            pdfName: basename(pdfPath),
+            screenshots: dataUrls,
+          });
+          
+          z.pdf_page_screenshot_files = [...(z.pdf_page_screenshot_files ?? []), ...saved];
+          const sel = state.selection[z.id];
+          sel.pdfScreens = [...(sel.pdfScreens ?? []), ...saved.map(() => true)];
+          
+          if (state.selectedZipId === z.id) {
+            await renderDetails();
+          }
+          
+          // 每处理完一个PDF后，强制垃圾回收
+          if (window.gc) {
+            window.gc();
+          }
+          
+        } catch (e) {
+          failedPdfs++;
+          console.error(`PDF截图生成失败: ${pdfPath}`, e);
+          setStatus(`PDF截图生成失败 (${processedPdfs}/${totalPdfs})：${basename(pdfPath)} - ${e?.message ?? e}`);
+          
+          // 等待一段时间后继续处理下一个文件
+          await new Promise(resolve => setTimeout(resolve, 1000));
         }
       }
     }
-    setStatus("PDF页面截图自动生成完成");
+    
+    const successCount = processedPdfs - failedPdfs;
+    if (failedPdfs > 0) {
+      setStatus(`PDF页面截图生成完成：成功 ${successCount} 个，失败 ${failedPdfs} 个`);
+    } else {
+      setStatus(`PDF页面截图自动生成完成：共处理 ${successCount} 个文件`);
+    }
+    
   } catch (e) {
-    console.error(e);
+    console.error("PDF截图生成过程出错:", e);
     setStatus(`PDF页面截图生成失败：${e?.message ?? e}`);
   } finally {
     state.pdfRendering.busy = false;
+    
+    // 最终清理
+    if (window.gc) {
+      window.gc();
+    }
   }
 }
 
@@ -1189,6 +1413,42 @@ el.exportBundleBtn.onclick = async () => {
   } catch (e) {
     console.error(e);
     setStatus(`导出失败：${e?.message ?? e}`);
+  }
+};
+
+el.cleanupBtn.onclick = async () => {
+  try {
+    // 显示确认对话框
+    const confirmed = confirm("确定要清理所有临时文件吗？\n\n这将删除所有已导入的ZIP文件和生成的临时数据，释放磁盘空间。\n清理后需要重新导入ZIP文件。");
+    
+    if (!confirmed) {
+      return;
+    }
+
+    setStatus("正在清理临时文件...");
+    el.cleanupBtn.disabled = true;
+    
+    const result = await invoke("cleanup_temp_files");
+    
+    // 清理成功后重置界面状态
+    state.batchId = null;
+    state.zips = [];
+    state.selectedZipId = null;
+    state.selection = {};
+    state.imageDataCache = {};
+    
+    // 更新界面
+    renderList();
+    renderDetails();
+    el.exportExcelBtn.disabled = true;
+    el.exportBundleBtn.disabled = true;
+    
+    setStatus(`清理完成：${result}`);
+  } catch (e) {
+    console.error(e);
+    setStatus(`清理失败：${e?.message ?? e}`);
+  } finally {
+    el.cleanupBtn.disabled = false;
   }
 };
 

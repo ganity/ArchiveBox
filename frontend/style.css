@@ -127,6 +127,35 @@ button#pickZipsBtn:hover {
   box-shadow: 0 2px 4px rgba(0, 0, 0, 0.15);
 }
 
+/* Cleanup Button Styling */
+.cleanup-btn {
+  background: #dc2626 !important;
+  /* Red 600 - Warning color */
+  color: white !important;
+  border-color: #dc2626 !important;
+}
+
+.cleanup-btn:hover:not(:disabled) {
+  background: #b91c1c !important;
+  /* Red 700 */
+  border-color: #b91c1c !important;
+  transform: translateY(-1px);
+}
+
+.cleanup-btn:disabled {
+  background: #fca5a5 !important;
+  /* Red 300 */
+  border-color: #fca5a5 !important;
+  opacity: 0.7;
+}
+
+/* Toolbar Separator */
+.toolbar-separator {
+  width: 1px;
+  background: var(--border);
+  margin: 0 4px;
+}
+
 /* Main Content Area */
 .content {
   flex: 1;
